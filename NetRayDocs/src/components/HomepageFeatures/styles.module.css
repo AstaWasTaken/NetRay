@@ -1,0 +1,56 @@
+/* Keep existing styles and add/modify these */
+
+.features {
+  display: flex;
+  align-items: center;
+  padding: 4rem 0;
+  width: 100%;
+  /* Optional alternating background can be nice */
+  background-color: var(--ifm-background-surface-color);
+}
+
+[data-theme='dark'] .features {
+    background-color: #1f1e23; /* Slightly different dark shade */
+}
+
+.featureContent {
+    padding: 1rem; /* Add some padding within the column */
+}
+
+.featureIcon {
+  display: block; /* Make icon a block element */
+  font-size: 3rem; /* Larger icon size */
+  margin-bottom: 1rem;
+  color: var(--ifm-color-primary); /* Use primary theme color for icon */
+  line-height: 1;
+}
+
+/* Optional: Styling if using actual SVGs */
+.featureSvg {
+  height: 100px; /* Adjust SVG size if using */
+  width: 100px;
+  margin-bottom: 1rem;
+}
+
+.features .col {
+    margin-bottom: 2rem; /* Ensure spacing between rows on mobile */
+    display: flex; /* Helps align content vertically if heights differ slightly */
+    flex-direction: column;
+}
+
+.featureTitle { /* Explicit style for title */
+    font-size: 1.25rem;
+    margin-bottom: 0.75rem;
+    font-weight: 600;
+    /* Color comes from Heading component default or theme */
+}
+
+.features .col p {
+    font-size: 0.95rem;
+    color: var(--ifm-color-content-secondary);
+}
+
+/* Adjust padding for consistency */
+.featureContent p {
+    padding: 0 0.5rem;
+}
