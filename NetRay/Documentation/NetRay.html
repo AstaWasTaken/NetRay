@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetRay Documentation</title>
+    <style>
+        /* --- Basic Reset & Root Variables --- */
+        :root {
+            --bg-color: #f8f9fa; /* Light background */
+            --text-color: #212529; /* Dark text */
+            --primary-color: #0d6efd; /* Bootstrap blue */
+            --secondary-color: #6c757d; /* Gray */
+            --accent-color: #0dcaf0; /* Cyan */
+            --nav-bg: #e9ecef; /* Light gray for nav */
+            --nav-text: #495057;
+            --nav-hover-bg: #dee2e6;
+            --code-bg: #282c34; /* Dark code background */
+            --code-text: #abb2bf; /* Light gray code text */
+            --border-color: #dee2e6;
+            --link-color: #0d6efd;
+            --admonition-note-bg: #cfe2ff;
+            --admonition-note-border: #9ec5fe;
+            --admonition-warning-bg: #fff3cd;
+            --admonition-warning-border: #ffda6a;
+
+            --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+            --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+        }
+
+        /* --- Dark Mode Palette (Optional - add JS toggle if desired) --- */
+        /* @media (prefers-color-scheme: dark) {
+            :root {
+                 --bg-color: #212529;
+                 --text-color: #f8f9fa;
+                 --nav-bg: #343a40;
+                 --nav-text: #adb5bd;
+                 --nav-hover-bg: #495057;
+                 --code-bg: #1e1e1e;
+                 --code-text: #d4d4d4;
+                 --border-color: #495057;
+                 --link-color: #6ea8fe;
+                 --admonition-note-bg: #0a2c5c;
+                 --admonition-note-border: #0d6efd;
+                 --admonition-warning-bg: #332701;
+                 --admonition-warning-border: #ffc107;
+            }
+        } */
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html {
+            scroll-behavior: smooth; /* Enable smooth scrolling */
+        }
+
+        body {
+            font-family: var(--font-sans);
+            line-height: 1.6;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex; /* Layout with sidebar */
+            font-size: 16px;
+        }
+
+        /* --- Navigation Sidebar --- */
+        #sidebar {
+            width: 260px;
+            height: 100vh;
+            position: fixed; /* Fixed position */
+            top: 0;
+            left: 0;
+            background-color: var(--nav-bg);
+            padding: 20px 15px;
+            overflow-y: auto; /* Allow scrolling if content exceeds height */
+            border-right: 1px solid var(--border-color);
+        }
+
+        #sidebar h2 {
+            font-size: 1.2em;
+            margin-bottom: 15px;
+            color: var(--primary-color);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 5px;
+        }
+
+        #sidebar nav ul {
+            list-style: none;
+        }
+
+        #sidebar nav ul ul {
+            padding-left: 15px;
+            margin-top: 5px;
+            border-left: 1px solid var(--border-color);
+        }
+
+        #sidebar nav li {
+            margin-bottom: 5px;
+        }
+
+        #sidebar nav a {
+            text-decoration: none;
+            color: var(--nav-text);
+            display: block;
+            padding: 5px 8px;
+            border-radius: 4px;
+            transition: background-color 0.2s ease;
+            font-size: 0.95em;
+        }
+
+        #sidebar nav a:hover {
+            background-color: var(--nav-hover-bg);
+            color: var(--primary-color);
+        }
+        /* Active state could be added with JS */
+        /* #sidebar nav a.active {
+            background-color: var(--primary-color);
+            color: white;
+        } */
+
+
+        /* --- Main Content Area --- */
+        #main-content {
+            margin-left: 260px; /* Account for fixed sidebar width */
+            padding: 30px 40px;
+            width: calc(100% - 260px); /* Full width minus sidebar */
+            max-width: 1000px; /* Limit content width for readability */
+            margin: 0 auto; /* Center content area */
+            margin-left: 260px; /* Keep the left margin for sidebar */
+        }
+
+        section {
+            margin-bottom: 50px;
+            padding-top: 20px; /* Offset for fixed header/nav if you add one */
+        }
+
+        h1, h2, h3, h4 {
+            margin-bottom: 15px;
+            margin-top: 25px;
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
+        h1 { font-size: 2.5em; margin-top: 0; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; }
+        h2 { font-size: 1.8em; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;}
+        h3 { font-size: 1.4em; }
+        h4 { font-size: 1.1em; color: var(--secondary-color); }
+
+        p {
+            margin-bottom: 15px;
+        }
+
+        a {
+            color: var(--link-color);
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        strong {
+            font-weight: 600;
+        }
+        em {
+            font-style: italic;
+        }
+
+        ul, ol {
+            margin-left: 25px;
+            margin-bottom: 15px;
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        /* --- Code Blocks --- */
+        pre {
+            background-color: var(--code-bg);
+            color: var(--code-text);
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto; /* Handle long lines */
+            margin: 20px 0;
+            font-size: 0.9em;
+            line-height: 1.4;
+        }
+
+        code {
+            font-family: var(--font-mono);
+        }
+        /* Inline code */
+        p > code, li > code {
+             background-color: var(--nav-bg);
+             padding: 0.2em 0.4em;
+             border-radius: 3px;
+             font-size: 0.9em;
+        }
+
+        /* Basic keyword highlighting (extend as needed) */
+        pre code .keyword { color: #c678dd; } /* Example: Lua keywords like local, function, if, end */
+        pre code .string { color: #98c379; } /* Strings */
+        pre code .number { color: #d19a66; } /* Numbers */
+        pre code .comment { color: #5c6370; font-style: italic; } /* Comments */
+        pre code .function-name { color: #61afef; } /* Function names */
+        pre code .type { color: #e5c07b; } /* Roblox Types / Class Names */
+
+
+        /* --- Admonitions --- */
+        .admonition {
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+            border-left: 5px solid;
+        }
+        .admonition-title {
+            font-weight: bold;
+            margin-bottom: 8px;
+            display: block;
+        }
+        .admonition.note {
+            background-color: var(--admonition-note-bg);
+            border-color: var(--admonition-note-border);
+        }
+        .admonition.note .admonition-title { color: #0a58ca; } /* Adjust color based on bg */
+
+        .admonition.warning {
+            background-color: var(--admonition-warning-bg);
+            border-color: var(--admonition-warning-border);
+        }
+         .admonition.warning .admonition-title { color: #997404; }/* Adjust color based on bg */
+
+
+        /* --- Responsive --- */
+        @media (max-width: 992px) {
+             #main-content {
+                 max-width: none; /* Allow content to take more width */
+             }
+        }
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column; /* Stack content */
+            }
+            #sidebar {
+                width: 100%;
+                height: auto; /* Auto height */
+                position: static; /* Remove fixed positioning */
+                border-right: none;
+                border-bottom: 1px solid var(--border-color);
+            }
+            #main-content {
+                margin-left: 0; /* Remove margin */
+                width: 100%;
+                padding: 20px 15px; /* Reduce padding */
+            }
+             h1 { font-size: 2em; }
+             h2 { font-size: 1.6em; }
+             h3 { font-size: 1.3em; }
+        }
+
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar Navigation -->
+    <aside id="sidebar">
+        <h2>NetRay Docs</h2>
+        <nav>
+            <ul>
+                <li><a href="#home">Home</a></li>
+                <li><a href="#getting-started">Getting Started</a></li>
+                <li><a href="#configuration">Configuration</a></li>
+                <li>
+                    <a href="#core-concepts">Core Concepts</a>
+                    <ul>
+                        <li><a href="#events">Events</a></li>
+                        <li><a href="#requests">Requests</a></li>
+                    </ul>
+                </li>
+                <li>
+                    <a href="#advanced-features">Advanced Features</a>
+                    <ul>
+                        <li><a href="#middleware">Middleware</a></li>
+                        <li><a href="#type-checking">Type Checking</a></li>
+                        <li><a href="#circuit-breakers">Circuit Breakers</a></li>
+                        <li><a href="#priorities">Priorities</a></li>
+                        <li><a href="#optimizations">Optimizations</a></li>
+                    </ul>
+                </li>
+                 <li><a href="#debugging">Debugging & Monitoring</a></li>
+                <li>
+                    <a href="#api-reference">API Reference</a>
+                     <ul>
+                        <li><a href="#api-netray">NetRay</a></li>
+                        <li><a href="#api-serverevent">ServerEvent</a></li>
+                        <li><a href="#api-clientevent">ClientEvent</a></li>
+                        <li><a href="#api-requestserver">RequestServer</a></li>
+                        <li><a href="#api-requestclient">RequestClient</a></li>
+                        <li><a href="#api-circuitbreaker">CircuitBreaker</a></li>
+                     </ul>
+                 </li>
+            </ul>
+        </nav>
+    </aside>
+
+    <!-- Main Documentation Content -->
+    <main id="main-content">
+
+        <section id="home">
+            <h1>Welcome to NetRay</h1>
+            <p><strong>NetRay</strong> is a modern, high-performance networking library for Roblox, designed to enhance developer experience and runtime efficiency.</p>
+
+            <p><img src="https://via.placeholder.com/800x150?text=NetRay+Networking" alt="NetRay Banner" style="width:100%; max-width: 800px; height: auto; border-radius: 5px; margin-bottom:15px;"></p>
+
+
+            <h2>Why NetRay?</h2>
+            <p>Built on top of Roblox's networking primitives, NetRay offers:</p>
+            <ul>
+                <li>⚡ <strong>Performance:</strong> Automatic batching, intelligent compression, and efficient binary serialization minimize network overhead.</li>
+                <li>🔒 <strong>Reliability:</strong> Circuit breakers prevent cascading failures, while built-in timeouts handle unresponsive endpoints.</li>
+                <li>🛡️ <strong>Type Safety:</strong> Define data structures and validate payloads automatically, catching errors early.</li>
+                <li>⚙️ <strong>Flexibility:</strong> Use middleware to intercept and modify data, implement custom logic like logging or rate limiting.</li>
+                <li>🚀 <strong>Developer Experience:</strong> A clear API using Promises for requests and organized event handling makes networking code cleaner and easier to manage.</li>
+                <li>📊 <strong>Monitoring:</strong> Built-in debugging signals provide insight into network traffic and internal operations.</li>
+            </ul>
+            <p>Whether you're building complex networked interactions or simply want a more robust and performant alternative to raw RemoteEvents/Functions, NetRay provides the tools you need.</p>
+            <h3>Getting Started</h3>
+            <p>Ready to dive in? Head over to the <a href="#getting-started">Getting Started</a> section.</p>
+        </section>
+
+        <section id="getting-started">
+            <h2>Getting Started with NetRay</h2>
+            <p>Follow these steps to integrate NetRay into your Roblox project.</p>
+
+            <h3>1. Installation</h3>
+            <p>Place the `NetRay` ModuleScript (which should contain `Client`, `Server`, `Shared`, and `ThirdParty` folders) into `ReplicatedStorage`.</p>
+            <p>Example Structure:</p>
+            <pre><code class="plaintext">ReplicatedStorage
+└── NetRay
+    ├── Client/
+    ├── Server/
+    ├── Shared/
+    └── ThirdParty/
+        ├── SignalPlus.lua
+        ├── Promise.lua
+        └── DataCompression.lua
+    ├── init.lua
+    └── ... (Other modules)</code></pre>
+
+             <h3>2. Basic Setup</h3>
+             <p>Require the module in your scripts:</p>
+
+             <h4>Server Script (e.g., in ServerScriptService)</h4>
+             <pre><code class="language-lua"><span class="comment">-- ServerScriptService/MyGameServerLogic.server.lua</span>
+
+<span class="keyword">local</span> ReplicatedStorage = <span class="function-name">game</span>:GetService(<span class="string">"ReplicatedStorage"</span>)
+<span class="keyword">local</span> NetRay = <span class="function-name">require</span>(ReplicatedStorage.NetRay)
+
+<span class="function-name">print</span>(<span class="string">"NetRay Server Initialized - Version:"</span>, NetRay.Version)
+
+<span class="comment">-- Register events/requests here...</span>
+<span class="keyword">local</span> myEvent = NetRay:RegisterEvent(<span class="string">"MyFirstEvent"</span>)
+myEvent:OnEvent(<span class="keyword">function</span>(player, data)
+    <span class="function-name">print</span>(player.Name, <span class="string">"sent:"</span>, data)
+<span class="keyword">end</span>)</code></pre>
+
+             <h4>Client Script (e.g., in StarterPlayerScripts)</h4>
+             <pre><code class="language-lua"><span class="comment">-- StarterPlayer/StarterPlayerScripts/MyGameClientLogic.client.lua</span>
+
+<span class="keyword">local</span> ReplicatedStorage = <span class="function-name">game</span>:GetService(<span class="string">"ReplicatedStorage"</span>)
+<span class="keyword">local</span> NetRay = <span class="function-name">require</span>(ReplicatedStorage.NetRay)
+<span class="keyword">local</span> Players = <span class="function-name">game</span>:GetService(<span class="string">"Players"</span>)
+<span class="keyword">local</span> LocalPlayer = Players.LocalPlayer
+
+<span class="function-name">print</span>(<span class="string">"NetRay Client Initialized - Version:"</span>, NetRay.Version)
+
+<span class="comment">-- Get events/requests here...</span>
+<span class="keyword">local</span> myEvent = NetRay:GetEvent(<span class="string">"MyFirstEvent"</span>)
+
+<span class="comment">-- Example: Send event</span>
+task.delay(<span class="number">5</span>, <span class="keyword">function</span>()
+    myEvent:FireServer({ message = <span class="string">"Hello from "</span> .. LocalPlayer.Name })
+<span class="keyword">end</span>)</code></pre>
+
+             <h3>3. Initial Run (Server)</h3>
+             <p>When the server first runs, NetRay creates a `NetRayRemotes` folder in `ReplicatedStorage` to store networking instances.</p>
+
+             <h3>Next Steps</h3>
+             <ul>
+                 <li><a href="#configuration">Configure NetRay</a></li>
+                 <li>Learn about <a href="#events">Events</a> and <a href="#requests">Requests</a>.</li>
+            </ul>
+        </section>
+
+        <section id="configuration">
+            <h2>Configuration</h2>
+             <p>NetRay offers several configuration points.</p>
+
+             <h3>Debugging & Monitoring</h3>
+             <p>Enable global monitoring via `NetRay.Debug.EnableMonitoring`. This allows you to connect to debug signals.</p>
+             <pre><code class="language-lua"><span class="comment">-- Enable monitoring</span>
+NetRay.Debug.EnableMonitoring({ enabled = <span class="keyword">true</span> })
+
+<span class="comment">-- Connect to signals (see Debugging section)</span>
+NetRay.Debug.Error:Connect(<span class="keyword">function</span>(...) <span class="function-name">warn</span>(<span class="string">"NetRay Error:"</span>, ...) <span class="keyword">end</span>)</code></pre>
+
+             <h3>Dynamic Sender (Internal)</h3>
+             <p>Configuration for batching and compression resides within the `DynamicSender.lua` script and currently requires direct editing.</p>
+             <pre><code class="language-lua"><span class="comment">-- Inside DynamicSender.lua (Default examples)</span>
+NetRaySender.Config = {
+	BatchingEnabled = <span class="keyword">true</span>,
+	BatchInterval = <span class="number">0.03</span>,
+	MaxBatchSize = <span class="number">15</span>,
+	MaxBatchWait = <span class="number">0.05</span>,
+	CompressionThreshold = <span class="number">256</span>, <span class="comment">-- bytes</span>
+	DebugMode = <span class="keyword">false</span>,
+	<span class="comment">-- ... and others</span>
+}</code></pre>
+            <div class="admonition warning">
+                 <p class="admonition-title">Internal Configuration</p>
+                 <p>Modifying `DynamicSender.Config` currently requires editing the library's internal code.</p>
+             </div>
+
+            <h3>Per-Event/Request Options</h3>
+            <p>Most features (type checking, compression hints, priorities, circuit breakers) are set when registering an event or request. See the relevant sections for examples.</p>
+        </section>
+
+        <section id="core-concepts">
+            <h2 id="events">Core Concepts: Events</h2>
+            <p>Events are unidirectional ("fire-and-forget") messages, similar to `RemoteEvent`.</p>
+            <h3>Server-Side Example</h3>
+            <pre><code class="language-lua"><span class="comment">-- Register event</span>
+<span class="keyword">local</span> playerActionEvent = NetRay:RegisterEvent(<span class="string">"PlayerAction"</span>, {
+    typeDefinition = { action = <span class="string">"string"</span>, position = <span class="type">"Vector3"</span> },
+    priority = NetRay.Priority.HIGH
+})
+
+<span class="comment">-- Listen for client events</span>
+playerActionEvent:OnEvent(<span class="keyword">function</span>(player, data)
+    <span class="function-name">print</span>(player.Name, <span class="string">"did"</span>, data.action, <span class="string">"at"</span>, data.position)
+<span class="keyword">end</span>)
+
+<span class="comment">-- Fire event to a client</span>
+<span class="keyword">local</span> somePlayer = <span class="comment">-- ...</span>
+playerActionEvent:FireClient(somePlayer, { action = <span class="string">"Healed"</span>, position = <span class="type">Vector3</span>.zero })
+
+<span class="comment">-- Fire event to all clients</span>
+playerActionEvent:FireAllClients({ action = <span class="string">"RoundStart"</span>, position = <span class="type">Vector3</span>.zero })</code></pre>
+
+            <h3>Client-Side Example</h3>
+             <pre><code class="language-lua"><span class="comment">-- Get event reference</span>
+<span class="keyword">local</span> playerActionEvent = NetRay:GetEvent(<span class="string">"PlayerAction"</span>)
+
+<span class="comment">-- Listen for server events</span>
+playerActionEvent:OnEvent(<span class="keyword">function</span>(data)
+    <span class="function-name">print</span>(<span class="string">"Server says:"</span>, data.action)
+<span class="keyword">end</span>)
+
+<span class="comment">-- Fire event to server</span>
+playerActionEvent:FireServer({ action = <span class="string">"Jump"</span>, position = <span class="comment">--[[ Current position ]]</span> })</code></pre>
+
+
+             <h2 id="requests">Core Concepts: Requests</h2>
+             <p>Requests are two-way messages requiring a response, like `RemoteFunction`. NetRay uses Promises.</p>
+             <h3>Server-Side Example</h3>
+            <pre><code class="language-lua"><span class="comment">-- Register request</span>
+<span class="keyword">local</span> getItemDataRequest = NetRay:RegisterRequestEvent(<span class="string">"GetItemData"</span>, {
+    requestTypeDefinition = { itemId = <span class="string">"number"</span> },
+    responseTypeDefinition = { name = <span class="string">"string"</span>, value = <span class="string">"number|nil"</span> }
+})
+
+<span class="comment">-- Handle client requests</span>
+getItemDataRequest:OnRequest(<span class="keyword">function</span>(player, data)
+    <span class="keyword">local</span> itemInfo = <span class="comment">-- ... get item info from data.itemId</span>
+    <span class="keyword">if</span> itemInfo <span class="keyword">then</span>
+        <span class="keyword">return</span> itemInfo <span class="comment">-- This goes back to client's .andThen()</span>
+    <span class="keyword">else</span>
+        <span class="function-name">error</span>(<span class="string">"Item not found"</span>) <span class="comment">-- This goes back to client's .catch()</span>
+    <span class="keyword">end</span>
+<span class="keyword">end</span>)</code></pre>
+
+            <h3>Client-Side Example</h3>
+            <pre><code class="language-lua"><span class="comment">-- Register request reference</span>
+<span class="keyword">local</span> getItemDataRequest = NetRay:RegisterRequestEvent(<span class="string">"GetItemData"</span>, { timeout = <span class="number">8</span> })
+
+<span class="comment">-- Make request to server</span>
+getItemDataRequest:Request({ itemId = <span class="number">123</span> })
+    :andThen(<span class="keyword">function</span>(itemData)
+        <span class="function-name">print</span>(<span class="string">"Got item:"</span>, itemData.name, <span class="string">"Value:"</span>, itemData.value)
+    <span class="keyword">end</span>)
+    :catch(<span class="keyword">function</span>(err)
+        <span class="function-name">warn</span>(<span class="string">"Failed to get item data:"</span>, err)
+    <span class="keyword">end</span>)</code></pre>
+        </section>
+
+        <section id="advanced-features">
+             <h2>Advanced Features</h2>
+
+             <h3 id="middleware">Middleware</h3>
+             <p>Intercept and process network data globally or per-event.</p>
+             <pre><code class="language-lua">NetRay:RegisterMiddleware(<span class="string">"Logger"</span>, <span class="keyword">function</span>(eventName, player, data)
+    <span class="function-name">print</span>(<span class="string">"MW:"</span>, eventName, player, data)
+    <span class="keyword">return</span> data <span class="comment">-- Return nil or data to continue, false to block</span>
+<span class="keyword">end</span>, <span class="number">50</span>) <span class="comment">-- Lower priority runs earlier</span>
+
+<span class="comment">-- NetRay:RemoveMiddleware("Logger") -- Requires custom implementation or access to manager</span></code></pre>
+
+             <h3 id="type-checking">Type Checking</h3>
+             <p>Define data structures in event/request options for automatic validation.</p>
+             <pre><code class="language-lua"><span class="comment">-- Example typeDefinition</span>
+{
+    id = <span class="string">"number"</span>,
+    name = <span class="string">"string"</span>,
+    tags = <span class="string">"Array<string>"</span>,          <span class="comment">-- Array of strings</span>
+    position = <span class="string">"?Vector3"</span>,              <span class="comment">-- Optional Vector3 (can be nil)</span>
+    config = <span class="string">"Dict<string, boolean>"</span>, <span class="comment">-- String keys, boolean values</span>
+    target = <span class="string">"Instance<BasePart>"</span>,   <span class="comment">-- Must be a BasePart or descendant</span>
+    value = <span class="string">"number|string"</span>       <span class="comment">-- Can be number OR string</span>
+}</code></pre>
+             <p>See `TypeChecker.lua` for the full list of supported type strings.</p>
+
+            <h3 id="circuit-breakers">Circuit Breakers</h3>
+             <p>Prevent cascading failures for unreliable operations. Configured per-event/request.</p>
+            <pre><code class="language-lua">NetRay:RegisterRequestEvent(<span class="string">"RiskyOp"</span>, {
+    circuitBreaker = {
+        failureThreshold = <span class="number">3</span>, <span class="comment">-- Open after 3 failures</span>
+        resetTimeout = <span class="number">15</span>,   <span class="comment">-- Try again after 15s</span>
+        fallback = <span class="keyword">function</span>(player, data)
+            <span class="function-name">warn</span>(<span class="string">"Circuit open for RiskyOp"</span>)
+            <span class="keyword">return</span> { success = <span class="keyword">false</span>, reason = <span class="string">"Temporarily unavailable"</span> }
+        <span class="keyword">end</span>
+    }
+})
+
+<span class="comment">-- Check status</span>
+<span class="keyword">local</span> cb = NetRay:GetCircuitBreaker(<span class="string">"RiskyOp"</span>)
+<span class="keyword">if</span> cb <span class="keyword">then</span> <span class="function-name">print</span>(cb.State) <span class="keyword">end</span></code></pre>
+
+             <h3 id="priorities">Priorities</h3>
+             <p>Control client-side event processing order.</p>
+             <pre><code class="language-lua">NetRay:RegisterEvent(<span class="string">"CriticalSync"</span>, { priority = NetRay.Priority.CRITICAL })
+NetRay:RegisterEvent(<span class="string">"PlayerChat"</span>, { priority = NetRay.Priority.NORMAL })
+NetRay:RegisterEvent(<span class="string">"Analytics"</span>, { priority = NetRay.Priority.BACKGROUND })
+
+<span class="comment">-- Priority Levels (Low value = High priority):</span>
+<span class="comment">-- CRITICAL = 0, HIGH = 1, NORMAL = 2, LOW = 3, BACKGROUND = 4</span></code></pre>
+
+            <h3 id="optimizations">Optimizations (Batching & Compression)</h3>
+            <p>NetRay automatically optimizes network traffic:</p>
+            <ul>
+                 <li><strong>Batching:</strong> Multiple server-to-client `:FireClient` calls for the same event may be grouped into one transmission. Controlled via `DynamicSender.Config` and the `batchable` event option (default true).</li>
+                <li><strong>Compression:</strong> Data exceeding `DynamicSender.Config.CompressionThreshold` (estimated) may be compressed using LZW if likely beneficial. Use the `compression` event/request option as a hint.</li>
+                <li><strong>Serialization:</strong> Uses an efficient binary format.</li>
+            </ul>
+        </section>
+
+         <section id="debugging">
+             <h2>Debugging & Monitoring</h2>
+            <p>Enable monitoring and connect to debug signals for insight.</p>
+            <pre><code class="language-lua"><span class="comment">-- Must be enabled first!</span>
+NetRay.Debug.EnableMonitoring({ enabled = <span class="keyword">true</span> })
+
+<span class="comment">-- Log all major internal signals</span>
+NetRay.Debug.GlobalEvent:Connect(<span class="keyword">function</span>(context, signalName, ...)
+    <span class="function-name">print</span>(<span class="string">"["</span>..context..<span class="string">" SIG] "</span>..signalName, ...)
+<span class="keyword">end</span>)
+
+<span class="comment">-- Log all internal errors</span>
+NetRay.Debug.Error:Connect(<span class="keyword">function</span>(context, source, ...)
+     <span class="function-name">warn</span>(<span class="string">"["</span>..context..<span class="string">" ERR] ("</span>..tostring(source)..<span class="string">"): "</span>, ...)
+<span class="keyword">end</span>)
+
+<span class="comment">-- Monitor circuit breaker state changes</span>
+<span class="keyword">local</span> cb = NetRay:GetCircuitBreaker(<span class="string">"SomeEventName"</span>)
+<span class="keyword">if</span> cb <span class="keyword">then</span>
+    cb.Signals.StateChanged:Connect(<span class="keyword">function</span>(old, new) <span class="function-name">print</span>(<span class="string">"CB State:"</span>, old, <span class="string">"->"</span>, new) <span class="keyword">end</span>)
+<span class="keyword">end</span></code></pre>
+            <div class="admonition note">
+                 <p class="admonition-title">Network Traffic</p>
+                 <p>The `NetRay.Debug.NetworkTraffic` signal exists but is currently a placeholder. Implementing actual byte-level traffic monitoring requires deeper integration.</p>
+             </div>
+         </section>
+
+        <section id="api-reference">
+             <h2 id="api-overview">API Reference</h2>
+
+             <h3 id="api-netray">NetRay (Top Level Module)</h3>
+            <ul>
+                <li><code>NetRay.Version: string</code></li>
+                <li><code>NetRay.Priority: table</code> - Constants: `CRITICAL`, `HIGH`, `NORMAL`, `LOW`, `BACKGROUND`.</li>
+                <li><code>NetRay.Debug: table</code> - Debugging signals and functions (`GlobalEvent`, `Error`, `EnableMonitoring`).</li>
+                <li><code>NetRay:RegisterMiddleware(name: string, func: function, priority: number?)</code></li>
+                <li><code>NetRay:RegisterEvent(name: string, options: table?) -> ServerEvent | ClientEvent</code></li>
+                 <li><code>NetRay:RegisterRequestEvent(name: string, options: table?) -> RequestServer | RequestClient</code></li>
+                 <li><code>NetRay:GetCircuitBreaker(name: string) -> CircuitBreaker?</code></li>
+                 <li><code>NetRay:GetEvent(name: string) -> ClientEvent</code> (Client Only)</li>
+                 <li><code>NetRay.Utils, .Errors, .Serializer, .TypeChecker</code> - Access to shared modules.</li>
+             </ul>
+             <h4>Event/Request Options (Common)</h4>
+            <ul>
+                <li><code>typeDefinition: table?</code></li>
+                <li><code>requestTypeDefinition: table?</code> (Requests only)</li>
+                <li><code>responseTypeDefinition: table?</code> (Requests only)</li>
+                <li><code>compression: boolean?</code></li>
+                <li><code>priority: number?</code> (See `NetRay.Priority`)</li>
+                 <li><code>batchable: boolean?</code> (Events only, default true)</li>
+                 <li><code>timeout: number?</code> (Requests only, default 10s)</li>
+                 <li><code>circuitBreaker: table?</code> (See Circuit Breaker section)</li>
+             </ul>
+
+             <h3 id="api-serverevent">ServerEvent</h3>
+             <ul>
+                 <li><code>:OnEvent(callback: function(player, data))</code></li>
+                 <li><code>:FireClient(player: Player, data: any)</code></li>
+                 <li><code>:FireAllClients(data: any)</code></li>
+                 <li><code>:FireAllClientsExcept(excludedPlayer: Player, data: any)</code></li>
+                 <li><code>:FireFilteredClients(filterFn: function(player), data: any)</code></li>
+             </ul>
+
+            <h3 id="api-clientevent">ClientEvent</h3>
+            <ul>
+                <li><code>:OnEvent(callback: function(data))</code></li>
+                 <li><code>:FireServer(data: any)</code></li>
+             </ul>
+
+            <h3 id="api-requestserver">RequestServer</h3>
+            <ul>
+                <li><code>:OnRequest(callback: function(player, data) -> response)</code></li>
+                <li><code>:Request(player: Player, data: any) -> Promise</code></li>
+             </ul>
+
+            <h3 id="api-requestclient">RequestClient</h3>
+            <ul>
+                <li><code>:OnRequest(callback: function(data) -> response)</code></li>
+                <li><code>:Request(data: any) -> Promise</code></li>
+            </ul>
+
+             <h3 id="api-circuitbreaker">CircuitBreaker</h3>
+            <ul>
+                 <li><code>State: string</code> ("CLOSED", "OPEN", "HALF_OPEN")</li>
+                 <li><code>FailureCount: number</code></li>
+                 <li><code>:IsAllowed() -> boolean</code></li>
+                 <li><code>:Execute(func, ...) -> result | fallbackResult</code></li>
+                 <li><code>:RecordSuccess()</code></li>
+                 <li><code>:RecordFailure()</code></li>
+                 <li><code>:ForceState(state: string)</code></li>
+                 <li><code>:GetMetrics() -> table</code></li>
+                 <li><code>Signals: table</code> (`StateChanged`, `FailureRecorded`, `SuccessRecorded`, `Recovered`)</li>
+            </ul>
+
+        </section>
+
+
+    </main>
+
+    <script>
+        // Basic smooth scroll for sidebar links
+        document.addEventListener('DOMContentLoaded', () => {
+            const sidebarLinks = document.querySelectorAll('#sidebar nav a');
+
+            sidebarLinks.forEach(link => {
+                link.addEventListener('click', function(event) {
+                    const href = this.getAttribute('href');
+                    // Ensure it's an internal anchor link
+                    if (href && href.startsWith('#')) {
+                        event.preventDefault(); // Prevent default jump
+                        const targetId = href.substring(1);
+                        const targetElement = document.getElementById(targetId);
+
+                        if (targetElement) {
+                             // Calculate offset if you have a fixed header later
+                             const offsetTop = targetElement.offsetTop; // Adjust as needed
+                            window.scrollTo({
+                                top: offsetTop - 15, // Small offset from top
+                                behavior: 'smooth'
+                             });
+                         }
+                     }
+                 });
+             });
+
+             // Optional: Basic code block keyword highlighting (very simple)
+             // You would need a much more robust parser for accurate highlighting
+            document.querySelectorAll('pre code.language-lua').forEach(block => {
+                 let html = block.innerHTML;
+                 // Simple replacements - add more keywords/patterns
+                html = html.replace(/\b(local|function|if|then|else|elseif|end|for|while|do|return|require|game|workspace|task|pairs|ipairs|pcall|print|warn|error|and|or|not)\b/g, '<span class="keyword">$&</span>');
+                html = html.replace(/([A-Z][a-zA-Z0-9]+)\.new\b/g, '<span class="type">$&</span>'); // Like Vector3.new
+                 html = html.replace(/\b(Vector3|Vector2|CFrame|Color3|UDim2|UDim|Rect|Instance|Player|RemoteEvent|RemoteFunction|ModuleScript)\b/g, '<span class="type">$&</span>'); // Common Roblox types
+                 html = html.replace(/(\-\-.*)/g, '<span class="comment">$1</span>'); // Comments
+                 html = html.replace(/(\"[^\"]*\")/g, '<span class="string">$1</span>'); // Double quoted strings
+                html = html.replace(/(\'[^\']*\')/g, '<span class="string">$1</span>'); // Single quoted strings
+                 html = html.replace(/([a-zA-Z_]\w*)\(/g, '<span class="function-name">$1</span>('); // Function calls
+                 html = html.replace(/(\b\d+(\.\d+)?\b)/g, '<span class="number">$1</span>'); // Numbers
+
+                 block.innerHTML = html;
+             });
+         });
+
+         // --- Optional: Intersection Observer for Active Nav Link ---
+         // More complex, adds overhead, but improves UX
+         /*
+         document.addEventListener('DOMContentLoaded', () => {
+            const sections = document.querySelectorAll('#main-content section');
+            const navLinks = document.querySelectorAll('#sidebar nav a');
+            const navMap = new Map();
+            navLinks.forEach(link => {
+                const href = link.getAttribute('href');
+                if (href && href.startsWith('#')) {
+                     navMap.set(href.substring(1), link);
+                }
+             });
+
+            const observerOptions = {
+                root: null, // relative to document viewport
+                rootMargin: '-20% 0px -80% 0px', // Trigger when section is 20% from top
+                threshold: 0 // As soon as 1px is visible within margin
+            };
+
+            const observer = new IntersectionObserver((entries) => {
+                 entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                         // Remove active class from all links
+                        navLinks.forEach(link => link.classList.remove('active'));
+                         // Add active class to the corresponding link
+                        const link = navMap.get(entry.target.id);
+                        if (link) {
+                            link.classList.add('active');
+
+                            // Optional: Ensure the active link is visible in the sidebar
+                            // link.scrollIntoView({ block: 'nearest' }); // Can be slightly jumpy
+                        }
+                     }
+                });
+            }, observerOptions);
+
+            sections.forEach(section => {
+                 observer.observe(section);
+             });
+         });
+         */
+
+    </script>
+
+</body>
+</html>
