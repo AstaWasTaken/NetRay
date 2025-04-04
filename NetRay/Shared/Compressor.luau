@@ -21,7 +21,6 @@ local Compressor = {}
     @return: Compressed data
 ]]
 function Compressor:Compress(data)
-    
     return DataCompression:Compress(data)
 end
 
@@ -31,7 +30,6 @@ end
     @return: Original uncompressed data
 ]]
 function Compressor:Decompress(compressedData)
-    
     return DataCompression:Decompress(compressedData)
 end
 

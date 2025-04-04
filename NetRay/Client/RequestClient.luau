@@ -53,7 +53,7 @@ function SerializeResponse(payload: any) : buffer?
 		if fallbackSuccess then
 			return fallbackSerialized :: buffer?
 		else
-			 warn("[NetRay RequestClient CRITICAL] Failed even to serialize S2C fallback error!")
+			warn("[NetRay RequestClient CRITICAL] Failed even to serialize S2C fallback error!")
 			return nil
 		end
 	end
@@ -62,8 +62,8 @@ end
 
 function RequestClient:SetupResponseHandler()
     if not self.RemoteFunction then
-         warn("[NetRay] Cannot setup response handler for", self.Name, " - RemoteFunction is nil")
-         return
+        warn("[NetRay] Cannot setup response handler for", self.Name, " - RemoteFunction is nil")
+        return
     end
 
 	self.RemoteFunction.OnClientInvoke = function(receivedData) -- This is the payload from server
@@ -83,9 +83,9 @@ function RequestClient:SetupResponseHandler()
                     if fallbackSuccess then
                         return { success = true, data = fallbackResult, fromFallback = true }
                     else
-                         logError(self.Name, "Client circuit breaker fallback function errored:", fallbackResult)
-                         return { success = false, error = "Service fallback failed." }
-                     end
+                        logError(self.Name, "Client circuit breaker fallback function errored:", fallbackResult)
+                        return { success = false, error = "Service fallback failed." }
+                    end
 				else
 					return { success = false, error = "Service unavailable (circuit open)" }
 				end
@@ -94,37 +94,37 @@ function RequestClient:SetupResponseHandler()
 			-- 3. Deserialize incoming request wrapper payload
 			local deserializeSuccess, requestPayloadWrapper = pcall(Serializer.Deserialize, receivedData)
 			if not deserializeSuccess then
-                 logError(self.Name, "Failed to deserialize S2C request wrapper:", requestPayloadWrapper)
-				 return { success = false, error = "Failed to process S2C request data format" }
+                logError(self.Name, "Failed to deserialize S2C request wrapper:", requestPayloadWrapper)
+				return { success = false, error = "Failed to process S2C request data format" }
 			end
             if requestPayloadWrapper == nil then
-                 logError(self.Name, "Deserialized S2C request wrapper is nil")
-                 return { success = false, error = "Received invalid S2C request wrapper" }
+                logError(self.Name, "Deserialized S2C request wrapper is nil")
+                return { success = false, error = "Received invalid S2C request wrapper" }
             end
             if typeof(requestPayloadWrapper) ~= "table" or requestPayloadWrapper.success == nil then
-                 logError(self.Name, "Invalid S2C request wrapper structure")
-                 return { success = false, error = "Invalid S2C request wrapper structure received" }
-             end
-             if not requestPayloadWrapper.success then -- Check if server sent an initial error
-                 logError(self.Name, "Received error payload from server:", requestPayloadWrapper.error)
-                 return { success = false, error = "Server indicated error in request: " .. tostring(requestPayloadWrapper.error)}
-             end
+                logError(self.Name, "Invalid S2C request wrapper structure")
+                return { success = false, error = "Invalid S2C request wrapper structure received" }
+            end
+            if not requestPayloadWrapper.success then -- Check if server sent an initial error
+               logError(self.Name, "Received error payload from server:", requestPayloadWrapper.error)
+               return { success = false, error = "Server indicated error in request: " .. tostring(requestPayloadWrapper.error)}
+            end
 
 
 			-- 4. Decompress the actual *data* if flagged by server
             local finalRequestData = requestPayloadWrapper.data
 			if requestPayloadWrapper.__compressed == true then
                 if typeof(finalRequestData) ~= "string" then
-                     logError(self.Name, "Server flagged compressed S2C data, but payload isn't string/binary.")
-                     return { success = false, error = "Inconsistent compression flag/payload type"}
+                    logError(self.Name, "Server flagged compressed S2C data, but payload isn't string/binary.")
+                    return { success = false, error = "Inconsistent compression flag/payload type"}
                 end
   
-                 local decompressSuccess, decompressedData = pcall(Compressor.Decompress, Compressor, finalRequestData)
-                 if not decompressSuccess then
-                    logError(self.Name, "Failed to decompress S2C request data:", decompressedData)
-				    return { success = false, error = "Failed to decompress S2C request data" }
-                 end
-				 finalRequestData = decompressedData
+                local decompressSuccess, decompressedData = pcall(Compressor.Decompress, Compressor, finalRequestData)
+                if not decompressSuccess then
+                	logError(self.Name, "Failed to decompress S2C request data:", decompressedData)
+					return { success = false, error = "Failed to decompress S2C request data" }
+                end
+				finalRequestData = decompressedData
 			end
 
 			-- 5. Type checking for the final request data
@@ -146,17 +146,17 @@ function RequestClient:SetupResponseHandler()
 
 			-- 7. Check Handler exists
 			if not self.Handler then
-                 logError(self.Name, "No handler registered for S2C request.")
-				 return { success = false, error = "No S2C request handler registered for " .. self.Name }
+                logError(self.Name, "No handler registered for S2C request.")
+				return { success = false, error = "No S2C request handler registered for " .. self.Name }
 			end
 
 			-- 8. Execute the user's Handler
 			local resultSuccess, resultOrError = pcall(self.Handler, dataForHandler)
 
 			if not resultSuccess then
-                 logError(self.Name, "S2C request handler errored:", resultOrError)
-				 if circuitBreaker then circuitBreaker:RecordFailure() end
-				 return { success = false, error = "S2C Request handler error: " .. tostring(resultOrError) }
+                logError(self.Name, "S2C request handler errored:", resultOrError)
+				if circuitBreaker then circuitBreaker:RecordFailure() end
+				return { success = false, error = "S2C Request handler error: " .. tostring(resultOrError) }
 			end
 
 			-- 9. Handler success path
@@ -176,14 +176,14 @@ function RequestClient:SetupResponseHandler()
             local dataToSend = resultData
             local dataWasCompressed = false
 			if self.UseCompression and Serializer.EstimateSize(dataToSend) > 1000 then
-                 local compressSuccess, compressed = pcall(Compressor.Compress, Compressor, dataToSend)
-                 if compressSuccess and compressed and Serializer.EstimateSize(compressed) < Serializer.EstimateSize(dataToSend) then
-                      print("[NetRay Client] Compressing S2C response data for", self.Name)
-                      dataToSend = compressed
-                      dataWasCompressed = true
-                 elseif not compressSuccess then
-                      logError(self.Name, "Failed to compress S2C response data:", compressed)
-                 end
+                local compressSuccess, compressed = pcall(Compressor.Compress, Compressor, dataToSend)
+                if compressSuccess and compressed and Serializer.EstimateSize(compressed) < Serializer.EstimateSize(dataToSend) then
+                    print("[NetRay Client] Compressing S2C response data for", self.Name)
+                    dataToSend = compressed
+                    dataWasCompressed = true
+                elseif not compressSuccess then
+                    logError(self.Name, "Failed to compress S2C response data:", compressed)
+                end
             end
 
             -- 12. Prepare successful response wrapper payload
@@ -199,15 +199,15 @@ function RequestClient:SetupResponseHandler()
 
         local finalPayload
         if not overallSuccess then
-             logError(self.Name, "CRITICAL Error during OnClientInvoke processing:", responseToSend)
-             finalPayload = { success = false, error = "Internal client error during S2C request handling." }
+            logError(self.Name, "CRITICAL Error during OnClientInvoke processing:", responseToSend)
+            finalPayload = { success = false, error = "Internal client error during S2C request handling." }
         else
             finalPayload = responseToSend
 		end
 
-         -- Final Step: Serialize the determined payload
-         local serializedBuffer = SerializeResponse(finalPayload)
-         return serializedBuffer
+        -- Final Step: Serialize the determined payload
+        local serializedBuffer = SerializeResponse(finalPayload)
+        return serializedBuffer
 	end
 end
 
@@ -232,11 +232,11 @@ function RequestClient:Request(data)
 	if circuitBreaker and not circuitBreaker:IsAllowed() then
 		if typeof(circuitBreaker.Options.fallback) == "function" then
 			return Promise.new(function(resolve, reject)
-                 -- Fallback is simple func
-                 local fbSuccess, fbResult = pcall(circuitBreaker.Options.fallback, data)
-                 if fbSuccess then resolve(fbResult)
-                 else reject(Errors.CIRCUIT_OPEN("Circuit fallback failed: " .. tostring(fbResult))) end
-             end)
+               -- Fallback is simple func
+               local fbSuccess, fbResult = pcall(circuitBreaker.Options.fallback, data)
+               if fbSuccess then resolve(fbResult)
+               else reject(Errors.CIRCUIT_OPEN("Circuit fallback failed: " .. tostring(fbResult))) end
+            end)
 		else
 			return Promise.reject(Errors.CIRCUIT_OPEN("Service unavailable (circuit open)"))
 		end
@@ -261,22 +261,22 @@ function RequestClient:Request(data)
     local payloadToSend = dataToSend
     local dataWasCompressed = false
     if self.UseCompression and Serializer.EstimateSize(payloadToSend) > 1000 then
-         local compressSuccess, compressed = pcall(Compressor.Compress, Compressor, payloadToSend)
-         if compressSuccess and compressed and Serializer.EstimateSize(compressed) < Serializer.EstimateSize(payloadToSend) then
-              print("[NetRay Client] Compressing C2S request data for", self.Name)
-              payloadToSend = compressed
-              dataWasCompressed = true
-         elseif not compressSuccess then
-              logError(self.Name, "C2S Request compression failed:", compressed)
-         end
+        local compressSuccess, compressed = pcall(Compressor.Compress, Compressor, payloadToSend)
+        if compressSuccess and compressed and Serializer.EstimateSize(compressed) < Serializer.EstimateSize(payloadToSend) then
+    		print("[NetRay Client] Compressing C2S request data for", self.Name)
+    		payloadToSend = compressed
+    		dataWasCompressed = true
+        elseif not compressSuccess then
+            logError(self.Name, "C2S Request compression failed:", compressed)
+        end
     end
 
     -- 6. Serialize the payload
     local serializedData
 	local serializeSuccess, serResult = pcall(Serializer.Serialize, payloadToSend)
     if not serializeSuccess then
-         logError(self.Name, "Failed to serialize C2S request data:", serResult)
-		 return Promise.reject(Errors.SERIALIZATION("Failed to serialize C2S request"))
+        logError(self.Name, "Failed to serialize C2S request data:", serResult)
+		return Promise.reject(Errors.SERIALIZATION("Failed to serialize C2S request"))
     end
     serializedData = serResult
 
@@ -320,10 +320,10 @@ function RequestClient:Request(data)
 			end
 
             if serverResultBuffer == nil then
-                 requestActive = false
-                 task.cancel(timeoutCoroutine)
-                 if circuitBreaker then circuitBreaker:RecordFailure() end
-                 return reject(Errors.NETWORK("Server returned nil response buffer"))
+                requestActive = false
+                task.cancel(timeoutCoroutine)
+                if circuitBreaker then circuitBreaker:RecordFailure() end
+                return reject(Errors.NETWORK("Server returned nil response buffer"))
             end
 
 			-- 8. Deserialize the server's response wrapper
@@ -339,42 +339,42 @@ function RequestClient:Request(data)
             end
 
 			if deserializedPayload == nil then
-                 requestActive = false; task.cancel(timeoutCoroutine)
-				 if circuitBreaker then circuitBreaker:RecordFailure() end
-				 reject(Errors.SERIALIZATION("Server response wrapper deserialized to nil"))
-				 return
+                requestActive = false; task.cancel(timeoutCoroutine)
+				if circuitBreaker then circuitBreaker:RecordFailure() end
+				reject(Errors.SERIALIZATION("Server response wrapper deserialized to nil"))
+				return
 			end
-             if typeof(deserializedPayload) ~= "table" or deserializedPayload.success == nil then
-                 requestActive = false; task.cancel(timeoutCoroutine)
-                 if circuitBreaker then circuitBreaker:RecordFailure() end
-                 return reject(Errors.SERIALIZATION("Invalid response wrapper structure received from server."))
-             end
+            if typeof(deserializedPayload) ~= "table" or deserializedPayload.success == nil then
+            	requestActive = false; task.cancel(timeoutCoroutine)
+            	if circuitBreaker then circuitBreaker:RecordFailure() end
+            	return reject(Errors.SERIALIZATION("Invalid response wrapper structure received from server."))
+            end
 
 
             -- 9. Check server success flag
 			if not deserializedPayload.success then
-                 requestActive = false; task.cancel(timeoutCoroutine)
-                 if circuitBreaker then circuitBreaker:RecordFailure() end
-				 reject(Errors.INTERNAL("Server Error: " .. tostring(deserializedPayload.error or "Unknown server error")))
-				 return
+                requestActive = false; task.cancel(timeoutCoroutine)
+                if circuitBreaker then circuitBreaker:RecordFailure() end
+				reject(Errors.INTERNAL("Server Error: " .. tostring(deserializedPayload.error or "Unknown server error")))
+				return
 			end
 
             -- 10. Decompress the *data* payload if flagged by server
             local finalServerData = deserializedPayload.data
 			if deserializedPayload.__compressed == true then
                 if typeof(finalServerData) ~= "string" then
+                   requestActive = false; task.cancel(timeoutCoroutine)
+                   if circuitBreaker then circuitBreaker:RecordFailure() end
+                   return reject(Errors.INTERNAL("Server indicated compressed data, but payload is not string/binary"))
+                end
+				
+                local decompressSuccess, decompressedData = pcall(Compressor.Decompress, Compressor, finalServerData)
+                if not decompressSuccess then
                     requestActive = false; task.cancel(timeoutCoroutine)
                     if circuitBreaker then circuitBreaker:RecordFailure() end
-                    return reject(Errors.INTERNAL("Server indicated compressed data, but payload is not string/binary"))
-                 end
-
-                 local decompressSuccess, decompressedData = pcall(Compressor.Decompress, Compressor, finalServerData)
-                 if not decompressSuccess then
-                     requestActive = false; task.cancel(timeoutCoroutine)
-                     if circuitBreaker then circuitBreaker:RecordFailure() end
-                     return reject(Errors.INTERNAL("Failed to decompress server response data: " .. tostring(decompressedData)))
-                 end
-                 finalServerData = decompressedData
+                    return reject(Errors.INTERNAL("Failed to decompress server response data: " .. tostring(decompressedData)))
+                end
+                finalServerData = decompressedData
 			end
 
              -- Success path - cancel timeout, check response type, resolve
