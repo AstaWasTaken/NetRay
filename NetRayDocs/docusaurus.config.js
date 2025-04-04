@@ -102,7 +102,7 @@ const config = {
             items: [
               {
                 label: 'DevForum Post', // CHANGE THIS
-                href: 'https://devforum.roblox.com/', // Add link to DevForum or other community page
+                href: 'https://devforum.roblox.com/t/netray-high-performance-roblox-networking-library/3592849', // Add link to DevForum or other community page
               },
               // Add Discord, Twitter, etc. if applicable
             ],
