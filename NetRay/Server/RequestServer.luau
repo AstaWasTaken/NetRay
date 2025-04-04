@@ -95,8 +95,8 @@ function RequestServer:SetupRequestHandler()
 				return { success = false, error = "Failed to process request data format" }
 			end
             if requestPayload == nil then
-                 logError(self.Name, "Deserialized request data is nil")
-                 return { success = false, error = "Received invalid request data"}
+                logError(self.Name, "Deserialized request data is nil")
+                return { success = false, error = "Received invalid request data"}
             end
 
             -- 4. Decompress *request* if needed (check *after* deserializing payload)
@@ -106,13 +106,13 @@ function RequestServer:SetupRequestHandler()
                 if decompressSuccess then
                     dataToProcess = decompressed
                 else
-                     logError(self.Name, "Failed to decompress request payload string:", decompressed)
-                     return { success = false, error = "Failed to decompress request payload" }
+                    logError(self.Name, "Failed to decompress request payload string:", decompressed)
+                    return { success = false, error = "Failed to decompress request payload" }
                 end
             end
 
-             -- Now dataToProcess holds the actual intended request data (like the { cause_error=true } table)
-             local finalRequestData = dataToProcess
+            -- Now dataToProcess holds the actual intended request data (like the { cause_error=true } table)
+            local finalRequestData = dataToProcess
 
 			-- 5. Type checking for request
 			if self.RequestTypeDefinition then
@@ -133,17 +133,17 @@ function RequestServer:SetupRequestHandler()
 
 			-- 7. Check Handler exists
 			if not self.Handler then
-                 logError(self.Name, "No request handler registered.")
-				 return { success = false, error = "No request handler registered for " .. self.Name }
+                logError(self.Name, "No request handler registered.")
+				return { success = false, error = "No request handler registered for " .. self.Name }
 			end
 
 			-- 8. Execute the user's Handler
 			local resultSuccess, resultOrError = pcall(self.Handler, player, dataForHandler)
 
 			if not resultSuccess then
-                 logError(self.Name, "Request handler errored:", resultOrError)
-				 if circuitBreaker then circuitBreaker:RecordFailure() end
-				 return { success = false, error = "Request handler error: " .. tostring(resultOrError) }
+                logError(self.Name, "Request handler errored:", resultOrError)
+				if circuitBreaker then circuitBreaker:RecordFailure() end
+				return { success = false, error = "Request handler error: " .. tostring(resultOrError) }
 			end
 
 			-- 9. Handler success path
@@ -276,9 +276,9 @@ function RequestServer:Request(player, data)
 			end
 
             if clientResultBuffer == nil then
-                 requestActive = false
-                 task.cancel(timeoutCoroutine)
-                 return reject(Errors.NETWORK("InvokeClient returned nil response"))
+                requestActive = false
+                task.cancel(timeoutCoroutine)
+                return reject(Errors.NETWORK("InvokeClient returned nil response"))
             end
 
 			-- 5. Deserialize the client's response wrapper
@@ -322,9 +322,9 @@ function RequestServer:Request(player, data)
 
                  local decompressSuccess, decompressedData = pcall(Compressor.Decompress, Compressor, finalClientData)
                  if not decompressSuccess then
-                     requestActive = false
-                     task.cancel(timeoutCoroutine)
-                     return reject(Errors.INTERNAL("Failed to decompress client response data: " .. tostring(decompressedData)))
+                    requestActive = false
+                    task.cancel(timeoutCoroutine)
+                    return reject(Errors.INTERNAL("Failed to decompress client response data: " .. tostring(decompressedData)))
                  end
                  finalClientData = decompressedData
 			end
