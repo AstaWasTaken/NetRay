@@ -1,7 +1,3 @@
---!strict
---!optimize 2
---!native
-
 --[[
     ServerEvent.lua
     Handles server-side event operations, with type validation and optimized networking
@@ -240,10 +236,7 @@ function ServerEvent:FireAllClients(data)
 	local allPlayers = Players:GetPlayers()
 
 	-- Use SendToMultiple for batch optimization
-	local result = DynamicSender:SendToMultiple(self.RemoteEvent, allPlayers, sendData, {
-		batchable = self.Batchable,
-		forceComparison = self.Options.forceComparison
-	})
+	local result = DynamicSender:SendToMany(self.RemoteEvent, sendData, allPlayers)
 
 	-- Log the batch send if debugging is enabled
 	if self.ServerManager.DebugEnabled then
@@ -285,10 +278,7 @@ function ServerEvent:FireAllClientsExcept(excludedPlayer, data)
 
 	-- Use DynamicSender to optimize batch sending
 	local sendData = processedData or data
-	DynamicSender:SendToMultiple(self.RemoteEvent, players, sendData, {
-		batchable = self.Batchable,
-		forceComparison = self.Options.forceComparison
-	})
+	DynamicSender:SendToMany(self.RemoteEvent, sendData, players)
 end
 
 function ServerEvent:FireFilteredClients(filter, data)
@@ -324,10 +314,7 @@ function ServerEvent:FireFilteredClients(filter, data)
 
 	-- Use DynamicSender to optimize batch sending
 	local sendData = processedData or data
-	DynamicSender:SendToMultiple(self.RemoteEvent, players, sendData, {
-		batchable = self.Batchable,
-		forceComparison = self.Options.forceComparison
-	})
+	DynamicSender:SendToMany(self.RemoteEvent, sendData, players)
 end
 
 return ServerEvent
