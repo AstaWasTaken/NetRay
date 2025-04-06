@@ -29,7 +29,7 @@ local MARKER_COMPRESSED_BATCH = 3
 NetRaySender.Config = {
 	BatchingEnabled = true,
 	BatchInterval = 0.03,
-	MaxBatchSize = 15,
+	MaxBatchSize = 20,
 	MaxBatchWait = 0.05,
 	CompressionThreshold = 256,     -- Data size (estimated) above which compression is attempted
 	DebugMode = false,            -- Enable debug messages
@@ -450,6 +450,7 @@ end
     Send the same data to multiple specific targets efficiently.
 ]]
 function NetRaySender:SendToMany(remote: RemoteEvent, data: any, targets: { Player })
+	print(remote,data,targets)
 	if not remote then
 		warn("[NetRaySender] Cannot SendToMany: RemoteEvent is nil.")
 		return
@@ -472,7 +473,7 @@ function NetRaySender:SendToMany(remote: RemoteEvent, data: any, targets: { Play
 
 	for _, target in ipairs(targets) do
 		if target and target.Parent then
-			pcall(remote.FireClient, remote, target, preparedData)
+			remote:FireClient(target, preparedData)
 		end
 	end
 end
