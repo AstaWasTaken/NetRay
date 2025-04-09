@@ -40,6 +40,7 @@ export type Types = {
 	Boolean1:				{boolean},
 	Boolean8:				boolean,
 	Characters:				string,
+	Binary:					string,
 	String:					string,
 	Buffer:					buffer,
 	Vector2S16:				Vector2,
@@ -62,7 +63,6 @@ export type Types = {
 	Region3:				Region3,
 	EnumItem:				EnumItem,
 	Instance:				Instance,
-	EfficientTable:         {[any]: any},
 }
 
 
@@ -88,6 +88,7 @@ local types = {
 	Boolean1 =				"table",
 	Boolean8 =				"boolean",
 	Characters =			"string",
+	Binary = 				"string",
 	String =				"string",
 	Buffer =				"buffer",
 	Vector2S16 =			"Vector2",
@@ -110,7 +111,6 @@ local types = {
 	Region3 =				"Region3",
 	EnumItem =				"EnumItem",
 	Instance =				"Instance",
-	EfficientTable =        "table",
 }
 
 

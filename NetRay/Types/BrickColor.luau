@@ -1,5 +1,6 @@
 --!strict
-
+--!optimize 2
+--!native
 -- Requires
 local Cursor = require(script.Parent.Cursor)
 

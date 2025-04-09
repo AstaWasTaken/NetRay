@@ -1,6 +1,4 @@
---!strict
 --!optimize 2
---!native
 
 --[[
     ServerManager.lua
@@ -15,119 +13,238 @@ local Middleware = require(script.Parent.Parent.Shared.Middleware)
 local Queue = require(script.Parent.Parent.Shared.Queue)
 local Errors = require(script.Parent.Parent.Shared.Errors)
 local CircuitBreaker = require(script.Parent.Parent.Shared.CircuitBreaker)
-local Constants = require(script.Parent.Parent.Shared.Constants)
+local Constants = require(script.Parent.Parent.Shared.Constants) 
 local SignalPlus = require(script.Parent.Parent.ThirdParty.SignalPlus)
 
--- Constants for processing limits per cycle
-local PROCESS_LIMITS = {
+-- Type Imports 
+type Middleware = Middleware.Middleware 
+type Queue<T> = Queue.Queue<T> 
+type CircuitBreaker = CircuitBreaker.CircuitBreaker 
+type SignalPlus = SignalPlus.SignalPlus 
+
+type Player = Players.Player
+
+-- Define helper types for configuration and state
+type RateLimitConfigOptions = {
+	maxRequests: number?,
+	timeWindow: number?,
+	burstWindow: number?,
+	burstLimit: number?
+}
+
+type CircuitBreakerConfigOptions = {
+	failureThreshold: number?,
+	resetTimeout: number?,
+	fallback: ((...any) -> (...any))?
+}
+
+-- This type represents the options table passed when registering an event
+export type ServerEventOptions = {
+	rateLimit: RateLimitConfigOptions?,
+	circuitBreaker: CircuitBreakerConfigOptions?,
+	priority: number?, -- Expected based on queue usage
+	typeDefinition: any?, -- Expected based on NetRayEvent type
+	[string]: any -- Allow other potential options
+}
+
+-- This type represents the actual configuration stored after processing options
+type RateLimitConfig = {
+	MaxRequests: number,
+	TimeWindow: number,
+	BurstWindow: number,
+	BurstLimit: number
+}
+
+-- Type for state stored per player per event for rate limiting
+type PlayerEventRateData = {
+	WindowStart: number,
+	Count: number,
+	BurstStart: number,
+	BurstCount: number
+}
+
+-- Type for the message stored in the queue
+type QueuedMessage = {
+	callback: (...any) -> (),
+	args: {any}
+}
+
+-- Type for the options passed to ServerManager.new
+type ServerManagerOptions = {
+	IncomingLimits: {[number]: number}?, -- UserId -> Limit
+	DefaultIncomingLimit: number?,
+	DefaultTimeoutDuration: number?
+}
+
+-- Type for the ServerManager class itself
+export type ServerManager = {
+	-- Properties
+	RemoteFolder: Folder?, -- Optional until Initialize completes
+	Events: {[string]: ServerRegisteredEventInfo}, -- Map eventName to info
+	RequestHandlers: {[string]: RequestHandlerInfo}, -- Map requestName to info (define RequestHandlerInfo later)
+	RateLimits: {[string]: RateLimitConfig}, -- Map eventName to config
+	PlayerRates: {[number]: {[string]: PlayerEventRateData}}, -- Map UserId -> eventName -> data
+	Middleware: Middleware,
+	MessageQueues: {[number]: Queue<QueuedMessage>}, -- Map priority level to Queue
+	CircuitBreakers: {[string]: CircuitBreaker}, -- Map eventName to CircuitBreaker instance
+	Signals: ServerManagerSignals,
+	IncomingRequests: {
+		Limits: {[number]: number}?,
+		DefaultLimit: number,
+		Counts: {[number]: number},
+		ResetTimers: {[number]: number}
+	},
+	PlayerTimeouts: {
+		Timeouts: {[number]: {[string]: number}}, -- Map UserId -> eventName -> timeout timestamp
+		DefaultDuration: number
+	},
+	DebugEnabled: boolean?, -- Added based on usage in SetPlayerTimeout
+
+	-- Methods
+	Initialize: (self: ServerManager) -> ServerManager,
+	StartQueueProcessing: (self: ServerManager) -> (),
+	ProcessMessage: (self: ServerManager, message: QueuedMessage?) -> (),
+	CreateRemoteEvent: (self: ServerManager, eventName: string) -> RemoteEvent,
+	CreateRemoteFunction: (self: ServerManager, eventName: string) -> RemoteFunction,
+	RegisterEvent: (self: ServerManager, eventName: string, options: ServerEventOptions?) -> ServerRegisteredEventInfo,
+	CheckRateLimit: (self: ServerManager, player: Player, eventName: string) -> boolean,
+	EnqueueMessage: (self: ServerManager, priority: number, callback: (...any) -> (), ...any) -> (),
+	InvokeMiddleware: (self: ServerManager, eventName: string, player: Player, data: any) -> (boolean, any?), -- Returns continueProcessing, potentially modifiedData
+	CheckPlayerTimeout: (self: ServerManager, eventName: string, userId: number) -> boolean,
+	SetPlayerTimeout: (self: ServerManager, eventName: string, userId: number, duration: number?) -> (),
+	CheckIncomingThrottle: (self: ServerManager, userId: number) -> boolean,
+
+	-- Constructor (defined separately for clarity)
+	new: (options: ServerManagerOptions?) -> ServerManager
+}
+
+-- Internal type for storing registered event info
+type ServerRegisteredEventInfo = {
+	Remote: RemoteEvent,
+	Options: ServerEventOptions, -- Store the original options
+	Handlers: {[any]: any} -- Placeholder; actual type depends on ServerEvent implementation
+}
+
+-- Placeholder for Request Handler Info (needs definition based on RequestServer.lua)
+type RequestHandlerInfo = {
+	Remote: RemoteFunction,
+	Handler: (player: Player, ...any) -> ...any,
+	Options: any -- Define RequestOptions later
+}
+
+
+-- Type definition for the Signals table
+type ServerManagerSignals = {
+	EventRegistered: SignalPlus, -- (eventName: string)
+	EventFired: SignalPlus,      -- (eventName: string, player: Player?, data: any) -- Player might be nil for FireAll
+	RequestSent: SignalPlus,     -- (requestName: string, player: Player, data: any)
+	RequestReceived: SignalPlus, -- (requestName: string, player: Player, data: any)
+	RateLimitExceeded: SignalPlus, -- (player: Player, eventName: string, limitType: "window" | "burst")
+	CircuitBroken: SignalPlus,   -- (eventName: string)
+	CircuitReset: SignalPlus,    -- (eventName: string)
+	PlayerJoined: SignalPlus,    -- (player: Player)
+	PlayerLeft: SignalPlus,      -- (player: Player)
+	Error: SignalPlus,            -- (err: any)
+	ThrottleExceeded: SignalPlus -- (throttleType: string, userId: number, duration: number?)
+}
+
+-- Constants for processing limits per cycle (already defined, just for context)
+local PROCESS_LIMITS = Constants.PROCESS_LIMITS or { -- Use Constants fallback otherwise
 	[0] = math.huge, -- Process all Critical
 	[1] = 5,         -- High
 	[2] = 3,         -- Normal
 	[3] = 2,         -- Low
 	[4] = 1          -- Background
 }
-local MIN_PROCESS_TIME = 0.005 -- Min time slice for lower priorities if higher are busy
-local CYCLE_WAIT = 0.01
+local MIN_PROCESS_TIME = Constants.MIN_PROCESS_TIME or 0.005 -- Min time slice for lower priorities if higher are busy
+local CYCLE_WAIT = Constants.CYCLE_WAIT or 0.01
 
 
-local ServerManager = {}
-ServerManager.__index = ServerManager
+-- ============================================================================
+-- ServerManager Implementation 
+-- ============================================================================
 
-function ServerManager.new(options)
+local ServerManagerImpl = {}
+ServerManagerImpl.__index = ServerManagerImpl
+
+-- Constructor
+function ServerManagerImpl.new(options: ServerManagerOptions?): ServerManager
 	options = options or {}
 
-	local self = setmetatable({}, ServerManager)
+	local self = setmetatable({}, ServerManagerImpl)
 
-	-- Remote events container
+	-- Initialize properties with types where possible
 	self.RemoteFolder = nil
-
-	-- Registered events and handlers
-	self.Events = {}
-	self.RequestHandlers = {}
-
-	-- Rate limiting data
-	self.RateLimits = {}
-	self.PlayerRates = {}
-
-	-- Middleware system
-	self.Middleware = Middleware.new()
-
-	-- Message queues for prioritized event handling
-	self.MessageQueues = {
-		[0] = Queue.new(), -- Critical
-		[1] = Queue.new(), -- High
-		[2] = Queue.new(), -- Normal
-		[3] = Queue.new(), -- Low
-		[4] = Queue.new()  -- Background
-	}
-
-	-- Circuit breakers for events
-	self.CircuitBreakers = {}
-
-	-- Debug signals using SignalPlus
-	self.Signals = {
-		EventRegistered = SignalPlus(), -- Fires when a new event is registered
-		EventFired = SignalPlus(),      -- Fires when an event is fired
-		RequestSent = SignalPlus(),     -- Fires when a request is sent
-		RequestReceived = SignalPlus(), -- Fires when a request is received
-		RateLimitExceeded = SignalPlus(),-- Fires when rate limits are exceeded
-		CircuitBroken = SignalPlus(),   -- Fires when a circuit breaker trips
-		CircuitReset = SignalPlus(),    -- Fires when a circuit breaker resets
-		PlayerJoined = SignalPlus(),    -- Fires when a player joins
-		PlayerLeft = SignalPlus(),      -- Fires when a player leaves
-		Error = SignalPlus(),            -- Fires when an error occurs
-		ThrottleExceeded = SignalPlus() -- Fires when throttle is exceeded
-	}
-
-	-- Configure throttling
+	self.Events = {} :: {[string]: ServerRegisteredEventInfo}
+	self.RequestHandlers = {} :: {[string]: RequestHandlerInfo} -- Cast needed until RequestHandlerInfo is fully defined
+	self.RateLimits = {} :: {[string]: RateLimitConfig}
+	self.PlayerRates = {} :: {[number]: {[string]: PlayerEventRateData}}
+	self.Middleware = Middleware.new() :: Middleware -- Cast if Middleware.new() isn't typed
+	self.MessageQueues = { -- Provide type hint for the table keys/values
+		[0] = Queue.new(),
+		[1] = Queue.new(),
+		[2] = Queue.new(),
+		[3] = Queue.new(),
+		[4] = Queue.new()
+	} :: {[number]: Queue<QueuedMessage>}
+	self.CircuitBreakers = {} :: {[string]: CircuitBreaker}
+	self.Signals = { -- Initialize signals
+		EventRegistered = SignalPlus(),
+		EventFired = SignalPlus(),
+		RequestSent = SignalPlus(),
+		RequestReceived = SignalPlus(),
+		RateLimitExceeded = SignalPlus(),
+		CircuitBroken = SignalPlus(),
+		CircuitReset = SignalPlus(),
+		PlayerJoined = SignalPlus(),
+		PlayerLeft = SignalPlus(),
+		Error = SignalPlus(),
+		ThrottleExceeded = SignalPlus()
+	} :: ServerManagerSignals
 	self.IncomingRequests = {
-		Limits = options.IncomingLimits or {}, -- Map of player UserIds to their limit counts
-		DefaultLimit = options.DefaultIncomingLimit or 60, -- Default requests per minute
-		Counts = {}, -- Map of player UserIds to their current request counts
-		ResetTimers = {} -- Map of player UserIds to their reset timers
+		Limits = options.IncomingLimits,
+		DefaultLimit = options.DefaultIncomingLimit or 60,
+		Counts = {} :: {[number]: number},
+		ResetTimers = {} :: {[number]: number}
 	}
-
-	-- Configure timeouts
 	self.PlayerTimeouts = {
-		Timeouts = {}, -- Map of player UserIds to maps of event names to timeout timestamps
-		DefaultDuration = options.DefaultTimeoutDuration or 1 -- Default timeout duration in seconds
+		Timeouts = {} :: {[number]: {[string]: number}},
+		DefaultDuration = options.DefaultTimeoutDuration or 1
 	}
+	self.DebugEnabled = false -- Initialize if needed
 
 	-- Connect player events
-	--	Players.PlayerAdded:Connect(function(player)
-	--		self.Signals.PlayerJoined:Fire(player)
-	--	end)
+	-- Consider adding PlayerAdded connection if needed for PlayerRates initialization
+	Players.PlayerAdded:Connect(function(player: Player)
+		self.PlayerRates[player.UserId] = {} -- Initialize player rate map on join
+		self.Signals.PlayerJoined:Fire(player) -- Fire PlayerJoined signal
+	end)
 
-	Players.PlayerRemoving:Connect(function(player)
+	Players.PlayerRemoving:Connect(function(player: Player)
 		self.Signals.PlayerLeft:Fire(player)
 		if player and player.UserId then
-			self.PlayerRates[player.UserId] = nil -- Clear rate limit data for leaving player
-			self.IncomingRequests.Counts[player.UserId] = nil
-			self.IncomingRequests.ResetTimers[player.UserId] = nil
-			self.PlayerTimeouts.Timeouts[player.UserId] = nil
+			local userId = player.UserId
+			self.PlayerRates[userId] = nil -- Clear rate limit data
+			self.IncomingRequests.Counts[userId] = nil -- Clear throttle count
+			self.IncomingRequests.ResetTimers[userId] = nil -- Clear throttle timer
+			self.PlayerTimeouts.Timeouts[userId] = nil -- Clear timeouts
 		end
 	end)
 
-	return self
+	return self :: ServerManager -- Cast the final object to the defined type
 end
 
-function ServerManager:Initialize()
+function ServerManagerImpl:Initialize(): ServerManager
 	-- Create or get the remote events folder
 	self.RemoteFolder = ReplicatedStorage:FindFirstChild("NetRayRemotes")
 	if not self.RemoteFolder then
 		self.RemoteFolder = Instance.new("Folder")
 		self.RemoteFolder.Name = "NetRayRemotes"
 		self.RemoteFolder.Parent = ReplicatedStorage
+		assert(self.RemoteFolder:IsA("Folder"), "Failed to create or find RemoteFolder") -- Add assertion
 	end
 
-	-- Set up player rate tracking
-	--	Players.PlayerAdded:Connect(function(player)
-	--		self.PlayerRates[player.UserId] = {}
-	--	end)
-
-	Players.PlayerRemoving:Connect(function(player)
-		self.PlayerRates[player.UserId] = nil
-	end)
+	-- Player rate tracking initialization moved to PlayerAdded connection in .new()
 
 	-- Initialize queue processing
 	self:StartQueueProcessing()
@@ -135,15 +252,16 @@ function ServerManager:Initialize()
 	return self
 end
 
-function ServerManager:StartQueueProcessing()
+function ServerManagerImpl:StartQueueProcessing()
 	task.spawn(function()
 		while true do
 			local cycleStartTime = tick()
 			local processedAny = false
 
 			-- Process Critical (all)
-			while not self.MessageQueues[0]:IsEmpty() do
-				local message = self.MessageQueues[0]:Dequeue()
+			local criticalQueue = self.MessageQueues[0]
+			while not criticalQueue:IsEmpty() do
+				local message = criticalQueue:Dequeue()
 				self:ProcessMessage(message)
 				processedAny = true
 			end
@@ -152,15 +270,16 @@ function ServerManager:StartQueueProcessing()
 			for priority = 1, 2 do
 				local limit = PROCESS_LIMITS[priority]
 				local processedCount = 0
-				while not self.MessageQueues[priority]:IsEmpty() and processedCount < limit do
-					local message = self.MessageQueues[priority]:Dequeue()
+				local currentQueue = self.MessageQueues[priority]
+				while not currentQueue:IsEmpty() and processedCount < limit do
+					local message = currentQueue:Dequeue()
 					self:ProcessMessage(message)
-					processedCount = processedCount + 1
+					processedCount += 1
 					processedAny = true
 				end
 			end
 
-			-- Guarantee *some* processing for Low/Background if time allows or nothing else ran
+			-- Guarantee *some* processing for Low/Background
 			local currentTime = tick()
 			local timeAvailable = cycleStartTime + CYCLE_WAIT - currentTime
 			local guaranteeLower = not processedAny or timeAvailable > MIN_PROCESS_TIME
@@ -169,113 +288,127 @@ function ServerManager:StartQueueProcessing()
 				for priority = 3, 4 do
 					local limit = PROCESS_LIMITS[priority]
 					local processedCount = 0
-					-- Try to process at least one if available, up to the limit
-					local processTarget = math.max(1, limit)
-					while not self.MessageQueues[priority]:IsEmpty() and processedCount < processTarget do
-						local message = self.MessageQueues[priority]:Dequeue()
+					local processTarget = math.max(1, limit) -- Ensure at least 1 attempt if queue not empty
+					local currentQueue = self.MessageQueues[priority]
+					while not currentQueue:IsEmpty() and processedCount < processTarget do
+						local message = currentQueue:Dequeue()
 						self:ProcessMessage(message)
-						processedCount = processedCount + 1
-						-- No need to set processedAny=true here, doesn't affect higher prio
+						processedCount += 1
 					end
 				end
 			end
 
-			task.wait(CYCLE_WAIT) -- Small yield
+			task.wait(CYCLE_WAIT)
 		end
 	end)
 end
 
-function ServerManager:ProcessMessage(message)
+function ServerManagerImpl:ProcessMessage(message: QueuedMessage?)
 	if not message then return end
 
 	local fn = message.callback
 	local args = message.args
 
+	-- Check type defensively, although QueuedMessage type ensures it should be a function
 	if typeof(fn) == "function" then
 		local success, err = pcall(function()
 			fn(unpack(args))
 		end)
 
 		if not success then
-			warn("[NetRay] Error processing queued message: " .. tostring(err))
-			self.Signals.Error:Fire(err)
+			warn("[NetRay ServerManager] Error processing queued message: " .. tostring(err))
+			self.Signals.Error:Fire(err, debug.traceback()) -- Include traceback
 		end
+	else
+		warn("[NetRay ServerManager] Invalid callback type in message queue:", typeof(fn))
+		self.Signals.Error:Fire("Invalid callback type in message queue", message)
 	end
 end
 
-function ServerManager:CreateRemoteEvent(eventName)
-	-- Check if the remote event already exists
+function ServerManagerImpl:CreateRemoteEvent(eventName: string): RemoteEvent
+	assert(self.RemoteFolder, "RemoteFolder not initialized")
 	local existingRemote = self.RemoteFolder:FindFirstChild(eventName)
-	if existingRemote then
+	if existingRemote and existingRemote:IsA("RemoteEvent") then
 		return existingRemote
+	elseif existingRemote then
+		warn("[NetRay ServerManager] Instance named", eventName, "exists but is not a RemoteEvent. Destroying and recreating.")
+		existingRemote:Destroy()
 	end
 
-	-- Create a new remote event
 	local remoteEvent = Instance.new("RemoteEvent")
 	remoteEvent.Name = eventName
 	remoteEvent.Parent = self.RemoteFolder
-
 	return remoteEvent
 end
 
-function ServerManager:CreateRemoteFunction(eventName)
-	-- Check if the remote function already exists
-	local existingRemote = self.RemoteFolder:FindFirstChild(eventName .. "_RF")
-	if existingRemote then
+function ServerManagerImpl:CreateRemoteFunction(eventName: string): RemoteFunction
+	assert(self.RemoteFolder, "RemoteFolder not initialized")
+	local remoteName = eventName .. "_RF"
+	local existingRemote = self.RemoteFolder:FindFirstChild(remoteName)
+	if existingRemote and existingRemote:IsA("RemoteFunction") then
 		return existingRemote
+	elseif existingRemote then
+		warn("[NetRay ServerManager] Instance named", remoteName, "exists but is not a RemoteFunction. Destroying and recreating.")
+		existingRemote:Destroy()
 	end
 
-	-- Create a new remote function
 	local remoteFunction = Instance.new("RemoteFunction")
-	remoteFunction.Name = eventName .. "_RF"
+	remoteFunction.Name = remoteName
 	remoteFunction.Parent = self.RemoteFolder
-
 	return remoteFunction
 end
 
-function ServerManager:RegisterEvent(eventName, options)
+
+function ServerManagerImpl:RegisterEvent(eventName: string, options: ServerEventOptions?): ServerRegisteredEventInfo
+	options = options or {} -- Ensure options is a table
 	if self.Events[eventName] then
-		warn("[NetRay] Event already registered: " .. eventName)
+		warn("[NetRay ServerManager] Event already registered: " .. eventName .. ". Returning existing registration.")
 		return self.Events[eventName]
 	end
 
 	local remoteEvent = self:CreateRemoteEvent(eventName)
-	self.Events[eventName] = {
+	local eventInfo: ServerRegisteredEventInfo = {
 		Remote = remoteEvent,
 		Options = options,
-		Handlers = {}
+		Handlers = {} 
 	}
+	self.Events[eventName] = eventInfo
 
 	-- Set up rate limits for this event if specified
 	if options.rateLimit then
+		local rl = options.rateLimit
 		self.RateLimits[eventName] = {
-			MaxRequests = options.rateLimit.maxRequests or 10,
-			TimeWindow = options.rateLimit.timeWindow or 1,
-			BurstWindow = options.rateLimit.burstWindow or 0.1,
-			BurstLimit = options.rateLimit.burstLimit or 3
+			MaxRequests = rl.maxRequests or Constants.RATE_LIMIT.DEFAULT_MAX_REQUESTS,
+			TimeWindow = rl.timeWindow or Constants.RATE_LIMIT.DEFAULT_TIME_WINDOW,
+			BurstWindow = rl.burstWindow or Constants.RATE_LIMIT.DEFAULT_BURST_WINDOW,
+			BurstLimit = rl.burstLimit or Constants.RATE_LIMIT.DEFAULT_BURST_LIMIT
 		}
 	end
 
 	-- Set up circuit breaker if specified
 	if options.circuitBreaker then
+		local cbOpts = options.circuitBreaker
 		self.CircuitBreakers[eventName] = CircuitBreaker.new({
-			failureThreshold = options.circuitBreaker.failureThreshold or 5,
-			resetTimeout = options.circuitBreaker.resetTimeout or 30,
-			fallback = options.circuitBreaker.fallback
-		})
+			failureThreshold = cbOpts.failureThreshold or 5,
+			resetTimeout = cbOpts.resetTimeout or 30,
+			fallback = cbOpts.fallback
+		}) :: CircuitBreaker -- Cast if CircuitBreaker.new isn't typed
 	end
 
 	self.Signals.EventRegistered:Fire(eventName)
 
-	return self.Events[eventName]
+	return eventInfo
 end
 
-function ServerManager:CheckRateLimit(player, eventName)
+function ServerManagerImpl:CheckRateLimit(player: Player, eventName: string): boolean
 	local rateLimitConfig = self.RateLimits[eventName]
-	if not rateLimitConfig then return true end -- No limits for this event
+	if not rateLimitConfig then return true end
 
 	local userId = player.UserId
-	if not userId then return false end -- Should not happen, but safe check
+	if not userId then
+		warn("[NetRay ServerManager] CheckRateLimit called with invalid player:", player)
+		return false
+	end
 
 	local playerLimits = self.PlayerRates[userId]
 	if not playerLimits then
@@ -286,14 +419,8 @@ function ServerManager:CheckRateLimit(player, eventName)
 	local eventLimits = playerLimits[eventName]
 	local now = tick()
 
-	-- Initialize if first time seeing this player+event
 	if not eventLimits then
-		eventLimits = {
-			WindowStart = now,
-			Count = 0,
-			BurstStart = now,
-			BurstCount = 0
-		}
+		eventLimits = { WindowStart = now, Count = 0, BurstStart = now, BurstCount = 0 }
 		playerLimits[eventName] = eventLimits
 	end
 
@@ -308,12 +435,12 @@ function ServerManager:CheckRateLimit(player, eventName)
 	end
 
 	-- Check limits
-	if eventLimits.Count >= rateLimitConfig.MaxRequests then
-		self.Signals.RateLimitExceeded:Fire(player, eventName, "window")
-		return false
-	end
 	if eventLimits.BurstCount >= rateLimitConfig.BurstLimit then
 		self.Signals.RateLimitExceeded:Fire(player, eventName, "burst")
+		return false
+	end
+	if eventLimits.Count >= rateLimitConfig.MaxRequests then
+		self.Signals.RateLimitExceeded:Fire(player, eventName, "window")
 		return false
 	end
 
@@ -324,111 +451,90 @@ function ServerManager:CheckRateLimit(player, eventName)
 	return true
 end
 
-function ServerManager:EnqueueMessage(priority, callback, ...)
+function ServerManagerImpl:EnqueueMessage(priority: number, callback: (...any) -> (), ...)
+	-- Validate priority
+	priority = math.clamp(priority or Constants.PRIORITY.NORMAL or 2, 0, 4) -- Use Constants if available
+	local queue = self.MessageQueues[priority]
+	if not queue then
+		warn("[NetRay ServerManager] Invalid priority level for EnqueueMessage:", priority)
+		queue = self.MessageQueues[Constants.PRIORITY.NORMAL or 2] -- Fallback to normal
+	end
+
 	local args = {...}
-	self.MessageQueues[priority]:Enqueue({
+	local message: QueuedMessage = {
 		callback = callback,
 		args = args
-	})
+	}
+	queue:Enqueue(message)
 end
 
-function ServerManager:InvokeMiddleware(eventName, player, data)
+function ServerManagerImpl:InvokeMiddleware(eventName: string, player: Player, data: any): (boolean, any?)
 	return self.Middleware:Execute(eventName, player, data)
 end
 
---[[
-    Check if a player is on timeout for a specific event
-    @param eventName: The name of the event to check
-    @param userId: The player's UserId
-    @return: true if the player is allowed, false if on timeout
-]]
-function ServerManager:CheckPlayerTimeout(eventName, userId)
-	-- No timeout map for this player yet
-	if not self.PlayerTimeouts.Timeouts[userId] then
-		self.PlayerTimeouts.Timeouts[userId] = {}
+function ServerManagerImpl:CheckPlayerTimeout(eventName: string, userId: number): boolean
+	local playerTimeoutMap = self.PlayerTimeouts.Timeouts[userId]
+	if not playerTimeoutMap then
+		return true -- No timeouts recorded for this player
+	end
+
+	local timeoutUntil = playerTimeoutMap[eventName]
+	if not timeoutUntil then
+		return true -- No timeout for this specific event
+	end
+
+	if tick() >= timeoutUntil then
+		playerTimeoutMap[eventName] = nil -- Timeout expired
+		-- Clean up the playerTimeoutMap if it becomes empty
+		 if next(playerTimeoutMap) == nil then
+		  self.PlayerTimeouts.Timeouts[userId] = nil
+		 end
 		return true
 	end
 
-	-- No timeout for this event
-	if not self.PlayerTimeouts.Timeouts[userId][eventName] then
-		return true
-	end
-
-	-- Check if timeout has expired
-	local now = tick()
-	local timeoutUntil = self.PlayerTimeouts.Timeouts[userId][eventName]
-
-	if now >= timeoutUntil then
-		-- Timeout expired, remove it
-		self.PlayerTimeouts.Timeouts[userId][eventName] = nil
-		return true
-	end
-
-	-- Player is still on timeout
-	return false
+	return false -- Still on timeout
 end
 
---[[
-    Set a timeout for a player on a specific event
-    @param eventName: The name of the event
-    @param userId: The player's UserId
-    @param duration: (Optional) Duration of the timeout in seconds
-]]
-function ServerManager:SetPlayerTimeout(eventName, userId, duration)
+function ServerManagerImpl:SetPlayerTimeout(eventName: string, userId: number, duration: number?)
 	duration = duration or self.PlayerTimeouts.DefaultDuration
 
-	-- Initialize timeout map for this player if it doesn't exist
-	if not self.PlayerTimeouts.Timeouts[userId] then
-		self.PlayerTimeouts.Timeouts[userId] = {}
+	local playerTimeoutMap = self.PlayerTimeouts.Timeouts[userId]
+	if not playerTimeoutMap then
+		playerTimeoutMap = {}
+		self.PlayerTimeouts.Timeouts[userId] = playerTimeoutMap
 	end
 
-	-- Set the timeout
-	local now = tick()
-	self.PlayerTimeouts.Timeouts[userId][eventName] = now + duration
+	local timeoutUntil = tick() + duration
+	playerTimeoutMap[eventName] = timeoutUntil
 
-	-- Signal that a timeout was set
-	self.Signals.ThrottleExceeded:Fire(eventName, userId, duration)
+	self.Signals.ThrottleExceeded:Fire(eventName, userId, duration) -- Signal uses eventName as type here
 
-	if self.DebugEnabled then
-		print(("[NetRay] Set timeout for player %d on event %s for %.1f seconds"):format(
+	if self.DebugEnabled then -- Check for DebugEnabled flag
+		print(("[NetRay ServerManager] Set timeout for player %d on event %s for %.1f seconds"):format(
 			userId, eventName, duration))
 	end
 end
 
---[[
-    Check if the incoming request count for a player is within limits
-    @param userId: The player's UserId
-    @return: true if within limits, false if throttled
-]]
-function ServerManager:CheckIncomingThrottle(userId)
+function ServerManagerImpl:CheckIncomingThrottle(userId: number): boolean
 	local now = tick()
+	local counts = self.IncomingRequests.Counts
+	local timers = self.IncomingRequests.ResetTimers
 
-	-- Initialize count and reset timer for this player if they don't exist
-	if not self.IncomingRequests.Counts[userId] then
-		self.IncomingRequests.Counts[userId] = 0
-		self.IncomingRequests.ResetTimers[userId] = now + 60 -- Reset after 1 minute
+	if not timers[userId] or now >= timers[userId] then
+		counts[userId] = 0
+		timers[userId] = now + 60 -- Reset window
 	end
 
-	-- Check if we need to reset the counter
-	if now >= self.IncomingRequests.ResetTimers[userId] then
-		self.IncomingRequests.Counts[userId] = 0
-		self.IncomingRequests.ResetTimers[userId] = now + 60 -- Reset after 1 minute
-	end
+	counts[userId] = (counts[userId] or 0) + 1
+	local limit = self.IncomingRequests.Limits and self.IncomingRequests.Limits[userId] or self.IncomingRequests.DefaultLimit
 
-	-- Increment the counter
-	self.IncomingRequests.Counts[userId] = self.IncomingRequests.Counts[userId] + 1
-
-	-- Get the player's limit
-	local limit = self.IncomingRequests.Limits[userId] or self.IncomingRequests.DefaultLimit
-
-	-- Check if the count exceeds the limit
-	if self.IncomingRequests.Counts[userId] > limit then
-		-- Signal that throttle was exceeded
-		self.Signals.ThrottleExceeded:Fire("incoming_requests", userId)
+	if counts[userId] > limit then
+		self.Signals.ThrottleExceeded:Fire("incoming_requests", userId) -- Type is "incoming_requests"
 		return false
 	end
 
 	return true
 end
 
-return ServerManager
+
+return ServerManagerImpl

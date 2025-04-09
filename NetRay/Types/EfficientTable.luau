@@ -1,5 +1,7 @@
 --!strict
 --!optimize 2
+--!native
+
 --[[
     EfficientTable.lua
     

@@ -1,4 +1,6 @@
 --!strict
+--!optimize 2
+--!native
 
 
 -- Types
@@ -67,7 +69,7 @@ end
 function Cursor:Allocate(amount)
 	local length = self.Index + amount
 	if length <= self.Length then return end
-	while self.Length < length do self.Length *= 2 end
+	while self.Length < length do self.Length *= 1.5 end
 	local newBuffer = buffer.create(self.Length)
 	buffer.copy(newBuffer, 0, self.Buffer, 0, self.Index)
 	self.Buffer = newBuffer
@@ -95,8 +97,10 @@ function Cursor:ReadS1()
 end
 
 function Cursor:WriteS1(value)
+	local bytesToWrite = 1
+	self:Allocate(bytesToWrite)
 	buffer.writei8(self.Buffer, self.Index, value)
-	self.Index += 1
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadS2()
@@ -106,8 +110,10 @@ function Cursor:ReadS2()
 end
 
 function Cursor:WriteS2(value)
+	local bytesToWrite = 2
+	self:Allocate(bytesToWrite)
 	buffer.writei16(self.Buffer, self.Index, value)
-	self.Index += 2
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadS3()
@@ -117,8 +123,10 @@ function Cursor:ReadS3()
 end
 
 function Cursor:WriteS3(value)
+	local bytesToWrite = 3
+	self:Allocate(bytesToWrite)
 	buffer.writebits(self.Buffer, self.Index * 8, 24, value + 8388608)
-	self.Index += 3
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadS4()
@@ -128,8 +136,10 @@ function Cursor:ReadS4()
 end
 
 function Cursor:WriteS4(value)
+	local bytesToWrite = 4
+	self:Allocate(bytesToWrite)
 	buffer.writei32(self.Buffer, self.Index, value)
-	self.Index += 4
+	self.Index += bytesToWrite
 end
 
 
@@ -141,8 +151,10 @@ function Cursor:ReadU1()
 end
 
 function Cursor:WriteU1(value)
+	local bytesToWrite = 1
+	self:Allocate(bytesToWrite)
 	buffer.writeu8(self.Buffer, self.Index, value)
-	self.Index += 1
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadU2()
@@ -152,8 +164,10 @@ function Cursor:ReadU2()
 end
 
 function Cursor:WriteU2(value)
+	local bytesToWrite = 2
+	self:Allocate(bytesToWrite)
 	buffer.writeu16(self.Buffer, self.Index, value)
-	self.Index += 2
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadU3()
@@ -163,8 +177,10 @@ function Cursor:ReadU3()
 end
 
 function Cursor:WriteU3(value)
+	local bytesToWrite = 3
+	self:Allocate(bytesToWrite)
 	buffer.writebits(self.Buffer, self.Index * 8, 24, value)
-	self.Index += 3
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadU4()
@@ -174,8 +190,10 @@ function Cursor:ReadU4()
 end
 
 function Cursor:WriteU4(value)
+	local bytesToWrite = 4
+	self:Allocate(bytesToWrite)
 	buffer.writeu32(self.Buffer, self.Index, value)
-	self.Index += 4
+	self.Index += bytesToWrite
 end
 
 
@@ -198,6 +216,8 @@ function Cursor:ReadF2()
 end
 
 function Cursor:WriteF2(value)
+	local bytesToWrite = 2
+	self:Allocate(bytesToWrite)
 	local offset = self.Index * 8
 	if value == 0 then
 		buffer.writebits(self.Buffer, offset, 16, 0b0_00000_0000000000)
@@ -215,7 +235,7 @@ function Cursor:WriteF2(value)
 		buffer.writebits(self.Buffer, offset + 10, 5, exponent + 14)
 		buffer.writebits(self.Buffer, offset + 15, 1, sign)
 	end
-	self.Index += 2
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadF3()
@@ -236,6 +256,8 @@ function Cursor:ReadF3()
 end
 
 function Cursor:WriteF3(value)
+	local bytesToWrite = 3
+	self:Allocate(bytesToWrite)
 	local offset = self.Index * 8
 	if value == 0 then
 		buffer.writebits(self.Buffer, offset, 24, 0b0_000000_00000000000000000) 
@@ -253,7 +275,7 @@ function Cursor:WriteF3(value)
 		buffer.writebits(self.Buffer, offset + 17, 6, exponent + 30)
 		buffer.writebits(self.Buffer, offset + 23, 1, sign)
 	end
-	self.Index += 3
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadF4()
@@ -263,8 +285,10 @@ function Cursor:ReadF4()
 end
 
 function Cursor:WriteF4(value)
+	local bytesToWrite = 4
+	self:Allocate(bytesToWrite)
 	buffer.writef32(self.Buffer, self.Index, value)
-	self.Index += 4
+	self.Index += bytesToWrite
 end
 
 function Cursor:ReadF8()
@@ -274,8 +298,10 @@ function Cursor:ReadF8()
 end
 
 function Cursor:WriteF8(value)
+	local bytesToWrite = 8
+	self:Allocate(bytesToWrite)
 	buffer.writef64(self.Buffer, self.Index, value)
-	self.Index += 8
+	self.Index += bytesToWrite
 end
 
 
@@ -287,8 +313,10 @@ function Cursor:ReadString(length)
 end
 
 function Cursor:WriteString(value)
-	buffer.writestring(self.Buffer, self.Index, value)
-	self.Index += #value
+	local bytesToWrite = #value
+	self:Allocate(bytesToWrite)
+	buffer.writestring(self.Buffer, self.Index, value, bytesToWrite) -- Explicitly add length
+	self.Index += bytesToWrite
 end
 
 
@@ -301,8 +329,10 @@ function Cursor:ReadBuffer(length)
 end
 
 function Cursor:WriteBuffer(value)
-	buffer.copy(self.Buffer, self.Index, value)
-	self.Index += buffer.len(value)
+	local bytesToWrite = buffer.len(value)
+	self:Allocate(bytesToWrite)
+	buffer.copy(self.Buffer, self.Index, value, 0, bytesToWrite) -- Add srcOffset=0 and length
+	self.Index += bytesToWrite
 end
 
 
@@ -313,6 +343,8 @@ function Cursor:ReadInstance()
 end
 
 function Cursor:WriteInstance(value)
+	local bytesToWrite = 0 -- No direct buffer write, but ensure allocation logic is consistent
+	self:Allocate(bytesToWrite)
 	self.InstanceIndex += 1
 	self.Instances[self.InstanceIndex] = value
 end

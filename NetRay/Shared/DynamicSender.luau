@@ -3,565 +3,1377 @@
 --!native
 
 --[[
-    NetRaySender.lua
+    DynamicSender Module (v1.2.8 - Standard Formatting)
 
-    Handles efficient serialization, optional compression, and batching
-    for the NetRay networking module. Batches are sent as a single buffer.
-    Uses an augmented compression marker byte to indicate batch status.
+    Implements dynamic strategy selection (LZ4 or Struct Array) for serialization.
+    Handles frame-based batching for network efficiency.
+    Requires correctly configured dependencies: Compressor (LZ4_Lib), Cursor, and Types.
+
 	Author: Asta (@TheYusufGamer)
 ]]
 
-local Serializer = require(script.Parent.Serializer)
-local Compressor = require(script.Parent.Compressor) -- Takes data, returns binary string
+--==============================================================================
+-- Dependencies
+--==============================================================================
+
 local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService") -- Used for size estimation
+local LZ4_Lib = require(script.Parent.Compressor)
+local CursorModule = require(script.Parent.Parent.Types.Cursor) 
+local TypesModule = require(script.Parent.Parent.Types.Types) 
 
-local NetRaySender = {}
 
--- Constants for the combined status marker byte
-local MARKER_BYTE_POS = 0
-local MARKER_UNCOMPRESSED_SINGLE = 0
-local MARKER_COMPRESSED_SINGLE = 1
-local MARKER_UNCOMPRESSED_BATCH = 2
-local MARKER_COMPRESSED_BATCH = 3
+--==============================================================================
+-- Type Imports / Exports
+--==============================================================================
 
--- Configuration
-NetRaySender.Config = {
-	BatchingEnabled = true,
-	BatchInterval = 0.03,
-	MaxBatchSize = 15,
-	MaxBatchWait = 0.05,
-	CompressionThreshold = 256,     -- Data size (estimated) above which compression is attempted
-	DebugMode = false,            -- Enable debug messages
-	ForceCompressBatches = true,   -- Always try to compress batches regardless of threshold
-	ForceCompressSingle = true,    -- Always try to compress single messages regardless of threshold
+type Cursor = CursorModule.Cursor
+type TypeCode = number
+type TypeName = string
+type SerializedResult = buffer
+
+-- Struct definition for optimized array serialization
+type StructFieldInfo = {
+	Name: string,
+	TypeName: TypeName, -- Can be "Nil"
+	TypeCode: TypeCode,
+	ReadFunc: ((cursor: Cursor) -> any)?, -- Nil if TypeName is "Nil"
+	WriteFunc: ((cursor: Cursor, value: any) -> ())?, -- Nil if TypeName is "Nil"
 }
 
+-- Type for the module's Config table
+type DynamicSenderConfig = {
+	MaxBatchSizeTrigger: number,
+	DebugMode: boolean,
+	StructArrayAllowNils: boolean,
+	StructArrayMaxSize: number,
+	StructArrayMaxDepth: number,
+}
+
+-- Type for the module's Metrics table (based on GetMetrics return)
+type DynamicSenderMetrics = {
+	serializeCount: number,
+	deserializeCount: number,
+	totalSerializeTime: number,
+	totalDeserializeTime: number,
+	errors: number,
+	lz4Payloads: number,
+	structArrayPayloads: number,
+	decodeErrors: number,
+	sendErrors: number,
+	avgSerializeTime: number,
+	avgDeserializeTime: number,
+}
+
+-- Type definition for the DynamicSender module export
+export type DynamicSenderModule = {
+	VERSION: string,
+	Config: DynamicSenderConfig,
+
+	-- Core Methods
+	Send: (self: DynamicSenderModule, remote: RemoteEvent, data: any, target: Player?, options: any?) -> (),
+	SendToMany: (self: DynamicSenderModule, remote: RemoteEvent, data: any, targets: { Player }) -> (), -- Server only
+	DecodeReceivedData: (self: DynamicSenderModule, rawDataBuffer: buffer, rawInstances: {Instance}?) -> {any}, -- Returns array of decoded messages
+
+	-- Utility/Lifecycle Methods
+	GetMetrics: (self: DynamicSenderModule) -> DynamicSenderMetrics,
+	ResetMetrics: (self: DynamicSenderModule) -> (),
+	FlushBatches: (self: DynamicSenderModule) -> (),
+}
+
+
+--==============================================================================
+-- Local Type Mappings & Module Setup
+--==============================================================================
+
+local BYTE_TO_TYPE_NAME: { [TypeCode]: TypeName } = {}
+local TYPE_CODES: { [TypeName]: TypeCode } = {}
+
+local DynamicSender = {}
+DynamicSender.VERSION = "1.2.8"
+
+--==============================================================================
+-- Constants
+--==============================================================================
+
+-- Strategy markers within the DynamicSender batch buffer
+local STRATEGY_LZ4 = 0xF1
+local STRATEGY_STRUCT_ARRAY = 0xF2
+
+--==============================================================================
+-- Configuration
+--==============================================================================
+
+DynamicSender.Config = {
+	MaxBatchSizeTrigger = 16 * 1024, -- Flush buffer if total bytes exceeds this threshold
+	DebugMode = false,
+	StructArrayAllowNils = false,
+	StructArrayMaxSize = 200,        -- Max elements allowed for Struct Array strategy
+	StructArrayMaxDepth = 1,        -- Max nesting allowed within Struct Array elements (1 = no nested tables)
+}
+
+--==============================================================================
 -- Internal State
-local batchQueues = {} -- Key: RemoteEvent instance, Value: table of { data = any, target = Player? }
-local batchTimers = {} -- Key: RemoteEvent instance, Value: thread
-local batchCreationTimes = {} -- Key: RemoteEvent instance, Value: os.clock()
+--==============================================================================
 
+local isClient = RunService:IsClient()
+local isServer = RunService:IsServer()
+local batchState: { [RemoteEvent]: { Cursor: Cursor, Targets: { [Player | string]: boolean } } } = {}
+local activeRemotes: { [RemoteEvent]: boolean } = {}
+local runServiceConnection: RBXScriptConnection | nil = nil
+
+-- Performance Metrics
+local metrics = {
+	serializeCount = 0, deserializeCount = 0, totalSerializeTime = 0, totalDeserializeTime = 0,
+	errors = 0, lz4Payloads = 0, structArrayPayloads = 0, decodeErrors = 0, sendErrors = 0
+}
+
+--==============================================================================
 -- Forward Declarations
-local processBatch
+--==============================================================================
 
---[[
-    Estimate the size of data before serialization/compression.
-]]
-local function estimateDataSize(data: any) 
-	local dataType = typeof(data)
-	if dataType == "string" then
-		return #data
-	elseif dataType == "buffer" then
-		return buffer.len(data) -- Shouldn't happen since compressor takes original data
-	elseif dataType == "table" then
-		-- Use JSONEncode for a rough size estimate of tables
-		local success, encoded = pcall(HttpService.JSONEncode, HttpService, data)
-		if success and typeof(encoded) == "string" then
-			return #encoded
-		else
-			return 1024 -- Fallback large size if JSON encoding fails
+local determineTypeForTarget: (value: any) -> (TypeName, TypeCode)
+local writeTargetInfoInternal: (cursor: Cursor, value: any) -> ()
+local readTargetInfoInternal: (cursor: Cursor) -> any
+local writeStructArrayInternal: (cursor: Cursor, data: { { [string]: any } }, structInfo: { StructFieldInfo }) -> ()
+local readStructArrayInternal: (cursor: Cursor) -> { { [string]: any } }
+local analyzeMetadata: (data: any) -> ({ [string]: any })
+local processFrameBatches: (triggeredRemote: RemoteEvent?) -> ()
+local getOrCreateBatchCursor: (remote: RemoteEvent) -> (Cursor, { [Player | string]: boolean })
+local writeBinaryPayloadInternal: (cursor: Cursor, payload: string) -> ()
+local getBestNumberType: (minVal: number, maxVal: number, isFloat: boolean) -> (TypeName, TypeCode)
+local isStructArrayCandidate : (data: any, depth: number, config: typeof(DynamicSender.Config)) -> ({ StructFieldInfo }?, number) 
+
+--==============================================================================
+-- Type Mapping Population
+--==============================================================================
+
+do
+	local function addTypeCode(name: string, code: number)
+		local isRequired = name=="Nil" or name:find("Number") or name=="Boolean8" or name=="String" or name=="Binary" or name=="Instance"
+		if isRequired and name ~= "Nil" and (not TypesModule.Writes[name] or not TypesModule.Reads[name]) then
+			error(`[DynamicSender FATAL] Missing Required Type Handler: '${name}'`)
 		end
-	elseif dataType == "number" then
-		return 8
-	elseif dataType == "boolean" then
-		return 1
-	elseif dataType == "Vector3" then
-		return 12
-	else
-		return 32 -- Default estimate for other types
+		TYPE_CODES[name] = code
+		BYTE_TO_TYPE_NAME[code] = name
+	end
+
+	-- Add required type mappings (Codes loosely based on potential usage frequency)
+	addTypeCode("Nil", 0x00)
+	addTypeCode("Boolean8", 0x01)
+	addTypeCode("NumberU8", 0x02); addTypeCode("NumberU16", 0x03); addTypeCode("NumberU24", 0x04); addTypeCode("NumberU32", 0x05);
+	addTypeCode("NumberS8", 0x10); addTypeCode("NumberS16", 0x11); addTypeCode("NumberS24", 0x12); addTypeCode("NumberS32", 0x13);
+	addTypeCode("NumberF16", 0x20); addTypeCode("NumberF24", 0x21); addTypeCode("NumberF32", 0x22); addTypeCode("NumberF64", 0x23);
+	addTypeCode("String", 0x40)       -- Standard String (U1 Length)
+	addTypeCode("Characters", 0x41) -- Compact Character String
+	addTypeCode("Buffer", 0x42)     -- Standard Buffer (U1 Length)
+	addTypeCode("Binary", 0x43)     -- Binary Payload (U3 Length for LZ4)
+
+	-- Roblox Types (Grouped for readability)
+	addTypeCode("Vector2F32", 0x60); addTypeCode("Vector2S16", 0x61); addTypeCode("Vector2F24", 0x68); -- 0x60-0x6F Vector2
+	addTypeCode("Vector3F32", 0x70); addTypeCode("Vector3S16", 0x71); addTypeCode("Vector3F24", 0x78); -- 0x70-0x7F Vector3
+	addTypeCode("Color3", 0x80)       -- 0x80-0x8F Colors
+	addTypeCode("BrickColor", 0x81)
+	addTypeCode("ColorSequence", 0x88)
+	addTypeCode("CFrameF32U16", 0x90); addTypeCode("CFrameF32U8", 0x91); addTypeCode("CFrameF24U8", 0x92); -- 0x90-0x9F CFrames
+	addTypeCode("UDim", 0xA0); addTypeCode("UDim2", 0xA1); -- 0xA0-0xA7 UDim
+	addTypeCode("Rect", 0xA8)          -- 0xA8-0xAF Rect/Region
+	addTypeCode("Region3", 0xA9)
+	addTypeCode("NumberRange", 0xB0); addTypeCode("NumberSequence", 0xB1); -- 0xB0-0xBF Sequences/Ranges
+	addTypeCode("EnumItem", 0xC0);     -- 0xC0-0xCF Enums/Instances
+	addTypeCode("Instance", 0xC1)      -- Important: Instance is distinct from Nil Player Target
+
+
+	-- Dynamically add missing optional types if handlers exist
+	local function checkAndAddOptional(name: string, proposedCode: number)
+		if TypesModule.Writes[name] and TypesModule.Reads[name] and not TYPE_CODES[name] then
+			addTypeCode(name, proposedCode)
+		end
+	end
+
+	-- Note: Ensure Binary (0x43) and Instance (0xC1) handlers are present due to their usage in core logic.
+	assert(TYPE_CODES.Binary and TypesModule.Writes.Binary and TypesModule.Reads.Binary, "Binary type handler is essential and missing.")
+	assert(TYPE_CODES.Instance and TypesModule.Writes.Instance and TypesModule.Reads.Instance, "Instance type handler is essential and missing.")
+	assert(TYPE_CODES.Nil and TYPE_CODES.Nil == 0x00, "Nil type must be defined and have code 0x00.")
+
+
+end
+
+--==============================================================================
+-- Serialization / Deserialization Helpers
+--==============================================================================
+
+local MAX_SERIALIZE_DEPTH = 32
+
+function GetNumberType(n)
+	if typeof(n) ~= "number" then return "not a number" end
+	return n % 1 == 0 and "integer" or "float"
+end
+
+
+-- Check if a number is an integer (handles floating point inaccuracies)
+local function isInteger(value: number): boolean
+	return GetNumberType(value) == "integer" or (GetNumberType(value) == "float" and math.abs(value - math.floor(value)) < 1e-7 and value > -9007199254740992 and value < 9007199254740992)
+end
+
+-- Helper to find the best fitting number type based on range and float status
+getBestNumberType = function(minVal: number, maxVal: number, isFloat: boolean): (TypeName, TypeCode)
+	-- Assumes minVal and maxVal are valid numbers as Nils were filtered
+	if isFloat then
+		local maxMagnitude = math.max(math.abs(minVal), math.abs(maxVal))
+
+		if maxMagnitude <= 2048 and TYPE_CODES.NumberF16 then
+			return "NumberF16", TYPE_CODES.NumberF16
+		elseif maxMagnitude <= 262144 and TYPE_CODES.NumberF24 then
+			return "NumberF24", TYPE_CODES.NumberF24
+		elseif maxMagnitude <= 16777216 and TYPE_CODES.NumberF32 then
+			return "NumberF32", TYPE_CODES.NumberF32
+		elseif TYPE_CODES.NumberF64 then
+			-- Fallback to F64 if magnitude exceeds F32 range or smaller handlers absent
+			return "NumberF64", TYPE_CODES.NumberF64
+		else
+			error("No suitable float handler (F16/F24/F32 missing and F64 missing)")
+		end
+	end
+	-- Integer checks - check MUST be paired with TYPE_CODES existence
+	if minVal >= 0 then -- Unsigned Candidate
+		if maxVal <= 255 and TYPE_CODES.NumberU8 then return "NumberU8", TYPE_CODES.NumberU8 end
+		if maxVal <= 65535 and TYPE_CODES.NumberU16 then return "NumberU16", TYPE_CODES.NumberU16 end
+		if maxVal <= 16777215 and TYPE_CODES.NumberU24 then return "NumberU24", TYPE_CODES.NumberU24 end
+		if maxVal <= 4294967295 and TYPE_CODES.NumberU32 then return "NumberU32", TYPE_CODES.NumberU32 end
+		warn("[DynamicSender NumOpt] Value exceeds U32 max for Struct Array field, using F64 fallback."); if TYPE_CODES.NumberF64 then return "NumberF64", TYPE_CODES.NumberF64 else error("F64 handler missing") end
+	else -- Signed Candidate (minVal < 0)
+		if minVal >= -128 and maxVal <= 127 and TYPE_CODES.NumberS8 then return "NumberS8", TYPE_CODES.NumberS8 end
+		if minVal >= -32768 and maxVal <= 32767 and TYPE_CODES.NumberS16 then return "NumberS16", TYPE_CODES.NumberS16 end
+		if minVal >= -8388608 and maxVal <= 8388607 and TYPE_CODES.NumberS24 then return "NumberS24", TYPE_CODES.NumberS24 end
+		if minVal >= -2147483648 and maxVal <= 2147483647 and TYPE_CODES.NumberS32 then return "NumberS32", TYPE_CODES.NumberS32 end
+		warn("[DynamicSender NumOpt] Value outside S32 range for Struct Array field, using F64 fallback."); if TYPE_CODES.NumberF64 then return "NumberF64", TYPE_CODES.NumberF64 else error("F64 handler missing") end
 	end
 end
 
---[[
-    Serializes the final payload (original or compressed) into a buffer.
-    Returns nil on failure.
-]]
-local function serializePayload(payload) : buffer?
-	local serializeSuccess, serializedBuffer = pcall(Serializer.Serialize, payload)
-	if not serializeSuccess then
-		warn("[NetRaySender] Failed to serialize payload:", serializedBuffer)
-		return nil
+-- Helper function to determine the best Vector2 subtype based on stats
+local function getBestVector2Type(stats: {minX:number, maxX:number, minY:number, maxY:number, hasFloat:boolean}): (TypeName?, TypeCode?)
+	if stats.hasFloat then
+		-- Floating point needed
+		-- Use magnitude squared for comparison to avoid sqrt
+		local maxMagSq = math.max(stats.minX*stats.minX, stats.maxX*stats.maxX, stats.minY*stats.minY, stats.maxY*stats.maxY)
+		-- Heuristic: Small magnitude might fit F24? Else F32. S16 check already failed.
+		-- Adjust threshold based on F24 precision/range if available
+		if maxMagSq <= (262144*262144) and TYPE_CODES.Vector2F24 then
+			return "Vector2F24", TYPE_CODES.Vector2F24
+		end
+		-- Default float type
+		if TYPE_CODES.Vector2F32 then
+			return "Vector2F32", TYPE_CODES.Vector2F32
+		end
+	else
+		-- All integer components
+		if stats.minX >= -32768 and stats.maxX <= 32767 and
+			stats.minY >= -32768 and stats.maxY <= 32767 and TYPE_CODES.Vector2S16 then
+			return "Vector2S16", TYPE_CODES.Vector2S16
+		end
+		-- If S16 fails, fallback to a float type (F32 is safest default)
+		if TYPE_CODES.Vector2F32 then
+			return "Vector2F32", TYPE_CODES.Vector2F32
+		end
 	end
-	if typeof(serializedBuffer) ~= "buffer" then
-		warn(`[NetRaySender] Serializer did not return a buffer, got: {typeof(serializedBuffer)}. Attempting conversion from string.`)
-		-- Attempt conversion if serializer accidentally returned string
-		if typeof(serializedBuffer) == "string" then
-			local ok, convertedBuffer = pcall(buffer.fromstring, serializedBuffer)
-			if ok then
-				return convertedBuffer
+	-- If no suitable handler is found (e.g., missing F32 and others fail)
+	warn("[NetRay StructOpt] Could not find suitable Vector2 handler.")
+	return nil, nil
+end
+
+-- Helper function to determine the best CFrame subtype based on stats
+-- Note: Optimizing CFrames is complex. This is a simplified heuristic based mainly on position magnitude
+-- and assumes rotation components might correlate. More advanced analysis could check rotation matrix components.
+-- Stats now only contain position component min/max
+local function getBestCFrameType(stats: {
+	cfPosMinX:number, cfPosMaxX:number,
+	cfPosMinY:number, cfPosMaxY:number,
+	cfPosMinZ:number, cfPosMaxZ:number
+	}): (TypeName?, TypeCode?)
+
+	-- Calculate max position component magnitude squared from the provided stats
+	local maxPosMagSq = math.max(
+		stats.cfPosMinX*stats.cfPosMinX, stats.cfPosMaxX*stats.cfPosMaxX,
+		stats.cfPosMinY*stats.cfPosMinY, stats.cfPosMaxY*stats.cfPosMaxY,
+		stats.cfPosMinZ*stats.cfPosMinZ, stats.cfPosMaxZ*stats.cfPosMaxZ
+	)
+	-- Avoid square root if possible by comparing against squared thresholds
+	-- Thresholds: F24 approx 262144, F32 approx 16777216
+	local F24_THRESHOLD_SQ = 262144 * 262144
+	local F32_THRESHOLD_SQ = 16777216 * 16777216
+
+	-- Choose subtype based on position magnitude heuristic and available types
+	if maxPosMagSq < F24_THRESHOLD_SQ and TYPE_CODES.CFrameF24U8 then
+		return "CFrameF24U8", TYPE_CODES.CFrameF24U8
+	elseif maxPosMagSq < F32_THRESHOLD_SQ and TYPE_CODES.CFrameF32U8 then
+		return "CFrameF32U8", TYPE_CODES.CFrameF32U8
+	elseif TYPE_CODES.CFrameF32U16 then
+		return "CFrameF32U16", TYPE_CODES.CFrameF32U16
+	elseif TYPE_CODES.CFrameF32U8 then
+		return "CFrameF32U8", TYPE_CODES.CFrameF32U8
+	elseif TYPE_CODES.CFrameF24U8 then
+		return "CFrameF24U8", TYPE_CODES.CFrameF24U8
+	end
+
+	warn("[NetRay StructOpt] Could not find any suitable CFrame handler (F24U8/F32U8/F32U16).")
+	return nil, nil
+end
+
+local function getBestVector3Type(stats: {minX:number,maxX:number,minY:number,maxY:number,minZ:number,maxZ:number, hasFloat:boolean}): (TypeName?, TypeCode?)
+	if stats.hasFloat then
+		-- Floating point needed
+		local maxMagSq = math.max(stats.minX*stats.minX, stats.maxX*stats.maxX, stats.minY*stats.minY, stats.maxY*stats.maxY, stats.minZ*stats.minZ, stats.maxZ*stats.maxZ)
+		-- Simplified check: If components reasonably small, maybe F24? Else F32. S16 check already failed.
+		if maxMagSq <= (262144*262144) and TYPE_CODES.Vector3F24 then return "Vector3F24", TYPE_CODES.Vector3F24 end
+		if TYPE_CODES.Vector3F32 then return "Vector3F32", TYPE_CODES.Vector3F32 end
+	else
+		-- All integer components
+		if stats.minX >= -32768 and stats.maxX <= 32767 and
+			stats.minY >= -32768 and stats.maxY <= 32767 and
+			stats.minZ >= -32768 and stats.maxZ <= 32767 and TYPE_CODES.Vector3S16 then
+			return "Vector3S16", TYPE_CODES.Vector3S16
+		end
+		-- If S16 fails, fallback to a float type (F32 is safest default)
+		if TYPE_CODES.Vector3F32 then return "Vector3F32", TYPE_CODES.Vector3F32 end
+	end
+	warn("[NetRay StructOpt] Could not find suitable Vector3 handler.")
+	return nil, nil
+end
+
+
+-- Determines TypeName and TypeCode for target serialization (Player or Nil)
+determineTypeForTarget = function(value: any): (TypeName, TypeCode)
+	if value == nil then
+		return "Nil", TYPE_CODES.Nil
+	end
+	if typeof(value) == "Instance" and value:IsA("Player") and TYPE_CODES.Instance then
+		return "Instance", TYPE_CODES.Instance
+	end
+	error("Invalid Target Type: "..typeof(value), 2)
+end
+
+-- Writes a binary string payload (from LZ4_Lib) using the Binary handler
+writeBinaryPayloadInternal = function(cursor: Cursor, payload: string)
+	local name = "Binary"
+	local code = TYPE_CODES[name]
+	local writer = TypesModule.Writes[name]
+	assert(code and writer, "Binary type handler is missing")
+	cursor:WriteU1(code)
+	writer(cursor, payload)
+end
+
+-- Writes target info (Nil or Player Instance) to the cursor
+writeTargetInfoInternal = function(cursor: Cursor, value: any)
+	local typeName, typeCode = determineTypeForTarget(value)
+	cursor:WriteU1(typeCode) -- Write Nil code or Instance code
+	if typeName ~= "Nil" then
+		local writer = TypesModule.Writes[typeName]
+		assert(writer, "Missing Writer for Target Type: " .. typeName)
+		writer(cursor, value) -- Call Instance writer
+	end
+end
+
+-- Reads target info (Nil or Player Instance) from the cursor
+readTargetInfoInternal = function(cursor: Cursor): any
+	local typeCode = cursor:ReadU1()
+	if typeCode == TYPE_CODES.Nil then
+		return nil
+	elseif typeCode == TYPE_CODES.Instance then
+		local reader = TypesModule.Reads.Instance
+		assert(reader, "Missing Reader for Instance Type")
+		return reader(cursor) -- Read Player Instance
+	else
+		error("Invalid Type Code for Target Info: " .. typeCode, 2)
+	end
+end
+
+--==============================================================================
+-- Metadata Analysis (Optimized to Single Pass + Finalization)
+--==============================================================================
+
+--[[
+	Checks if the given 'data' looks like a valid array of uniform structures (structs)
+	that can potentially be optimized for network transmission.
+
+	It performs several passes:
+	1. Initial validation (type, depth, size).
+	2. Analyzes the first element to determine the expected structure (keys and base types)
+	   and initializes statistics (min/max for numbers/vectors, etc.).
+	3. Verifies that all subsequent elements match the structure of the first element
+	   (same keys, same base types) and updates the collected statistics.
+	4. Based on the collected statistics (e.g., min/max range, presence of floats),
+	   determines the most optimal, compact data type for each field (e.g., Int8 vs Float64).
+	5. Builds and returns an array of `StructFieldInfo` objects describing the optimized
+	   structure, or nil if the data is not a candidate.
+
+	Args:
+		data (any): The data to analyze. Expected to be an array of tables.
+		depth (number): The current recursion depth (used to prevent overly nested structures).
+		config (typeof(NetRay.Config)): Configuration object containing limits like
+		                                 StructArrayMaxDepth and StructArrayMaxSize.
+
+	Returns:
+		({ StructFieldInfo }?, number): An array of field information if it's a valid candidate,
+		                                otherwise nil. Also returns the maximum depth reached during analysis.
+]]
+isStructArrayCandidate = function(data: any, depth: number, config: typeof(DynamicSender.Config))
+	: ({ StructFieldInfo }?, number) -- Return type annotation
+
+	-- =========================================================================
+	-- Pass 0: Initial Checks & Validation
+	-- =========================================================================
+
+	-- Prevent excessive recursion or overly nested data structures
+	if depth > config.StructArrayMaxDepth then
+		return nil, depth -- Exceeded maximum nesting depth for struct arrays
+	end
+
+	-- The top-level data must be a table (specifically, an array)
+	if typeof(data) ~= "table" then
+		return nil, depth -- Input data must be a table
+	end
+
+	-- Check array size constraints
+	local count = #data
+	if count == 0 or count > config.StructArrayMaxSize then
+		-- Array must have at least one element to determine structure,
+		-- and must not exceed the configured maximum size.
+		return nil, depth
+	end
+
+	-- Get the first element to analyze its structure
+	local firstElement = data[1]
+	if typeof(firstElement) ~= "table" then
+		-- The elements themselves must be tables (structs)
+		return nil, depth
+	end
+
+	-- =========================================================================
+	-- Data Structures for Analysis
+	-- =========================================================================
+
+	-- Stores initial information derived from the first element's fields
+	-- Used to ensure subsequent elements have the same keys and base types.
+	local initialFieldInfo: { [string]: {
+		Name: string,             -- The key of the field
+		InitialTypeName: TypeName, -- The initial guess for the type (e.g., "Number", "Vector3")
+		InitialTypeCode: TypeCode?, -- The type code if it's a simple, fixed type initially
+		BaseType: string          -- The fundamental Lua type (typeof(value))
+	} } = {}
+
+	-- Stores detailed statistics collected across all elements for each field.
+	-- Used in Pass 3 to determine the optimal final data type.
+	local fieldAnalysis: { [string]: {
+		-- Stats for 'number' type optimization
+		numMin: number?, numMax: number?, numHasNonInt: boolean?, -- Tracks if any number value was not an integer
+
+		-- Stats for 'Vector3' type optimization
+		v3MinX: number?, v3MaxX: number?,
+		v3MinY: number?, v3MaxY: number?,
+		v3MinZ: number?, v3MaxZ: number?,
+		v3HasFloat: boolean?, -- Tracks if any Vector3 component was not an integer
+
+		-- Stats for 'Vector2' type optimization
+		v2MinX: number?, v2MaxX: number?,
+		v2MinY: number?, v2MaxY: number?,
+		v2HasFloat: boolean?, -- Tracks if any Vector2 component was not an integer
+
+		-- Stats for 'CFrame' position optimization (Rotation is often handled separately or ignored for simple cases)
+		cfPosMinX: number?, cfPosMaxX: number?,
+		cfPosMinY: number?, cfPosMaxY: number?,
+		cfPosMinZ: number?, cfPosMaxZ: number?,
+		-- Note: No CFrame rotation stats collected in this simplified version (as noted in original)
+	} } = {}
+
+	-- Maintains the order of keys as found in the first element.
+	-- Used later to iterate fields consistently, although the final result is sorted.
+	local keyOrder: { string } = {}
+
+	-- Tracks the maximum depth reached during analysis (relevant if nested tables were allowed,
+	-- though currently they cause the analysis to fail for the struct array itself).
+	local maxD = depth
+
+	-- =========================================================================
+	-- Pass 1: Analyze First Element & Initialize Stats
+	-- Iterate through the first element to establish the expected structure and baseline stats.
+	-- =========================================================================
+	for key, value in pairs(firstElement) do
+		-- Ensure keys are strings
+		if typeof(key) ~= "string" then
+			return nil, maxD -- Struct keys must be strings
+		end
+
+		-- Assuming struct fields cannot be nil. Handling nils would require specific logic.
+		if value == nil then
+			-- If nil is meant to be a supported field type, handle it explicitly here.
+			-- Otherwise, this rejection is likely correct for simple struct arrays.
+			return nil, maxD -- Fields cannot be nil in this implementation
+		end
+
+		local baseType = typeof(value)
+		local initialTypeName: TypeName? = nil
+		local initialTypeCode: TypeCode? = nil
+		local supported = false -- Is this type supported *by this struct array system*?
+		local analysisData = {} -- Initialize empty stats for this field by default
+
+		-- Check for supported base types and initialize stats accordingly
+		if baseType == "number" then
+			initialTypeName = "Number" -- Generic starting point, will be refined later in Pass 3
+			supported = true
+			local n = value :: number
+			analysisData = {
+				numMin = n,
+				numMax = n,
+				numHasNonInt = not isInteger(n)
+			}
+		elseif baseType == "string" then -- Covers Luau 'string' type (used for Characters, Binary, String)
+			-- Assuming strings are supported and have a basic type code.
+			-- Add length check from config if needed: e.g., and #value <= config.MaxStringLength
+			if TYPE_CODES and TYPE_CODES.String then
+				initialTypeName, initialTypeCode = "String", TYPE_CODES.String
+				supported = true
+				-- No specific range/content stats needed for basic strings here
 			else
-				return nil
+				supported = false -- String type code not defined or strings not supported
 			end
-		else
-			warn("[NetRaySender] Cannot proceed with non-buffer/non-string serialized data.")
-			return nil
-		end
-	end
-	return serializedBuffer
-end
-
-
---[[
-    Prepares data for sending: Handles compression, serializes,
-    and prepends the appropriate status marker byte (0-3).
-    @param data: The raw data (single item OR array of items for batch).
-    @param isBatch: Boolean indicating if 'data' represents a batch.
-    @param forceCompressionCheck: Bool to force check compression.
-    @return: buffer ready to send, or nil on failure.
-]]
-local function prepareDataForSend(data: any, isBatch: boolean, forceCompressionCheck: boolean) : buffer?
-	local estimatedSize = estimateDataSize(data)
-	local shouldAttemptCompress = forceCompressionCheck or (NetRaySender.Config.CompressionThreshold > 0 and estimatedSize >= NetRaySender.Config.CompressionThreshold)
-
-	local finalPayloadToSerialize = data -- Start assuming original data
-	local wasCompressed = false
-	local compressedBinaryString = nil -- Keep track if compression occurred
-
-	if shouldAttemptCompress then
-		if NetRaySender.Config.DebugMode then print(`[NetRaySender DBG] Attempting compression. Estimated Size: {estimatedSize}. Batch: {isBatch}`) end
-
-		local compSuccess, _compressedString = pcall(Compressor.Compress, Compressor, data)
-		if compSuccess and typeof(_compressedString) == "string" and #_compressedString > 0 then
-			compressedBinaryString = _compressedString :: string
-			-- Optimization: Don't serialize yet. Just compare raw string lengths for a heuristic.
-			-- This avoids potentially costly serialization of original data if compressed is clearly smaller.
-			-- Note: Serialized size can differ from raw string size, but this is a reasonable estimate.
-			if #compressedBinaryString < estimateDataSize(data) then -- Compare compressed string len vs original estimate
-				if NetRaySender.Config.DebugMode then print(`[NetRaySender DBG] Compression likely beneficial based on raw sizes. Original Est: {estimatedSize}, Comp Len: {#compressedBinaryString}`) end
-				finalPayloadToSerialize = compressedBinaryString -- Choose compressed payload
-				wasCompressed = true
+		elseif baseType == "boolean" then
+			-- Assuming a specific boolean type code exists (like Boolean8 for 1 byte)
+			if TYPE_CODES and TYPE_CODES.Boolean8 then
+				initialTypeName, initialTypeCode = "Boolean8", TYPE_CODES.Boolean8
+				supported = true
+				-- No specific stats needed
 			else
-				if NetRaySender.Config.DebugMode then print(`[NetRaySender DBG] Compression not beneficial based on raw sizes. Original Est: {estimatedSize}, Comp Len: {#compressedBinaryString}. Sending original.`) end
-				-- finalPayloadToSerialize remains the original 'data'
-				wasCompressed = false
+				supported = false -- Boolean type code not defined
 			end
+		elseif baseType == "Vector3" then
+			initialTypeName = "Vector3" -- Generic starting point, refined in Pass 3
+			supported = true
+			local v = value :: Vector3
+			analysisData = {
+				v3MinX = v.X, v3MaxX = v.X,
+				v3MinY = v.Y, v3MaxY = v.Y,
+				v3MinZ = v.Z, v3MaxZ = v.Z,
+				v3HasFloat = not (isInteger(v.X) and isInteger(v.Y) and isInteger(v.Z))
+			}
+		elseif baseType == "Vector2" then
+			initialTypeName = "Vector2" -- Generic starting point, refined in Pass 3
+			supported = true
+			local v = value :: Vector2
+			analysisData = {
+				v2MinX = v.X, v2MaxX = v.X,
+				v2MinY = v.Y, v2MaxY = v.Y,
+				v2HasFloat = not (isInteger(v.X) and isInteger(v.Y))
+			}
+		elseif baseType == "CFrame" then
+			initialTypeName = "CFrame" -- Generic starting point, refined in Pass 3
+			supported = true
+			local cf = value :: CFrame
+			local p = cf.Position -- Luau knows this is Vector3
+			analysisData = {
+				-- Only tracking position stats for optimization decisions in this version
+				cfPosMinX = p.X, cfPosMaxX = p.X,
+				cfPosMinY = p.Y, cfPosMaxY = p.Y,
+				cfPosMinZ = p.Z, cfPosMaxZ = p.Z,
+				-- TODO: Could add flags/stats for rotation if needed for CFrame subtypes
+			}
+		elseif baseType == "Color3" then
+			if TYPE_CODES and TYPE_CODES.Color3 then
+				initialTypeName, initialTypeCode = "Color3", TYPE_CODES.Color3
+				supported = true
+			else
+				supported = false
+			end
+		elseif baseType == "BrickColor" then
+			if TYPE_CODES and TYPE_CODES.BrickColor then
+				initialTypeName, initialTypeCode = "BrickColor", TYPE_CODES.BrickColor
+				supported = true
+			else
+				supported = false
+			end
+		elseif baseType == "UDim" then
+			if TYPE_CODES and TYPE_CODES.UDim then
+				initialTypeName, initialTypeCode = "UDim", TYPE_CODES.UDim
+				supported = true
+			else
+				supported = false
+			end
+		elseif baseType == "UDim2" then
+			if TYPE_CODES and TYPE_CODES.UDim2 then
+				initialTypeName, initialTypeCode = "UDim2", TYPE_CODES.UDim2
+				supported = true
+			else
+				supported = false
+			end
+		elseif baseType == "Rect" then
+			if TYPE_CODES and TYPE_CODES.Rect then
+				initialTypeName, initialTypeCode = "Rect", TYPE_CODES.Rect
+				supported = true
+			else
+				supported = false
+			end
+		elseif baseType == "EnumItem" then
+			if TYPE_CODES and TYPE_CODES.EnumItem then
+				initialTypeName, initialTypeCode = "EnumItem", TYPE_CODES.EnumItem
+				supported = true
+			else
+				supported = false
+			end
+
+			-- Types generally considered UNSUITABLE for this simple struct array optimization:
+		elseif baseType == "Instance" then
+			-- Instances require specific network handling (replication/referencing)
+			supported = false
+		elseif baseType == "buffer" then
+			-- Buffers are mutable and might be large; usually handled separately.
+			supported = false
+		elseif baseType == "NumberRange" then
+			-- Complex type, usually not part of simple struct optimization.
+			supported = false
+		elseif baseType == "NumberSequence" then
+			-- Variable length sequence, not a fixed struct field.
+			supported = false
+		elseif baseType == "ColorSequence" then
+			-- Variable length sequence, not a fixed struct field.
+			supported = false
+		elseif baseType == "Region3" then
+			-- Complex type, usually not part of simple struct optimization.
+			supported = false
+			-- Note: 'Any', 'Static', 'Nil' are conceptual or handled elsewhere (nil check above).
+
+			-- Nested tables disqualify the parent from being a *simple* struct array.
+		elseif baseType == "table" then
+			-- Check depth first
+			if depth + 1 > config.StructArrayMaxDepth then
+				return nil, depth + 1 -- Nested table exceeds max depth allowed
+			end
+			-- Mark as unsupported *for this struct array analysis*, update max depth.
+			supported = false
+			maxD = math.max(maxD, depth + 1)
+			-- The `if not supported then return nil...` below will handle this case.
 		else
-			if NetRaySender.Config.DebugMode then warn("[NetRaySender WARN] Compression failed or returned non-string/empty:", _compressedString) end
-			-- Proceed with original data if compression fails
-			wasCompressed = false
-			-- finalPayloadToSerialize remains the original 'data'
+			-- Any other baseType encountered is currently unsupported by this system.
+			supported = false
 		end
-	else
-		-- Not attempting compression
-		wasCompressed = false
+
+		-- If the type of this field is not supported for struct arrays (based on the logic above),
+		-- then the whole data structure isn't a candidate for this optimization.
+		if not supported then
+			return nil, maxD
+		end
+
+		-- Store the information for this valid field found in the first element
+		table.insert(keyOrder, key)
+		initialFieldInfo[key] = {
+			Name = key,
+			InitialTypeName = initialTypeName :: TypeName, -- Type assertion ok because supported=true checked above
+			InitialTypeCode = initialTypeCode,
+			BaseType = baseType
+		}
+		fieldAnalysis[key] = analysisData -- Store initialized stats for this field (might be {})
 	end
 
-	-- Serialize the *chosen* payload ONCE
-	local serializedBuffer = serializePayload(finalPayloadToSerialize) -- Only one serialization call
-	if not serializedBuffer then
-		warn("[NetRaySender ERR] Failed to serialize final payload.")
-		return nil -- Cannot proceed
+	-- If the first element had no valid/supported fields (e.g., it was empty,
+	-- or only contained unsupported types like Instances or nested tables),
+	-- it's not a valid struct array candidate.
+	if #keyOrder == 0 then
+		return nil, maxD
 	end
 
-	-- Determine the final marker byte based on compression AND batch status
-	local markerByte: number
-	if isBatch then
-		markerByte = if wasCompressed then MARKER_COMPRESSED_BATCH else MARKER_UNCOMPRESSED_BATCH
-	else
-		markerByte = if wasCompressed then MARKER_COMPRESSED_SINGLE else MARKER_UNCOMPRESSED_SINGLE
-	end
+	-- =========================================================================
+	-- Pass 2: Verify elements 2 through N & Update detailed stats
+	-- Ensure all other elements match the structure derived from the first element
+	-- and update the min/max/float statistics.
+	-- =========================================================================
+	local expectedKeyCount = #keyOrder
+	for i = 2, count do
+		local element = data[i]
 
-	-- Prepend the single marker byte
-	local finalBuffer = buffer.create(1 + buffer.len(serializedBuffer))
-	buffer.writeu8(finalBuffer, MARKER_BYTE_POS, markerByte)
-	buffer.copy(finalBuffer, 1, serializedBuffer, 0, buffer.len(serializedBuffer))
+		-- Basic check: ensure the element is a table
+		if typeof(element) ~= "table" then
+			return nil, maxD -- All elements must be tables
+		end
 
-	if NetRaySender.Config.DebugMode then
-		print(`[NetRaySender DBG] Prepared data. Final buffer size: {buffer.len(finalBuffer)}, Marker: {markerByte} (Compressed: {wasCompressed}, Batch: {isBatch})`)
-	end
+		local elementKeyCount = 0
+		for key, value in pairs(element) do
+			elementKeyCount += 1
 
-	return finalBuffer
-end
-
---[[
-    Decodes received data, using the status marker to handle compression
-    and identify batches.
-    @param rawData: The raw buffer received from the network.
-    @return: Decoded data (single item or table of items for batches), or nil on failure.
-]]
-function NetRaySender:DecodeReceivedData(rawData)
-	if typeof(rawData) ~= "buffer" then
-		warn("[NetRaySender] Decode expected a buffer, received:", typeof(rawData))
-		return rawData
-	end
-	if buffer.len(rawData) < 1 then -- Need at least 1 byte for marker
-		warn("[NetRaySender] Decode received an empty or too small buffer.")
-		return nil
-	end
-
-	-- 1. Read the combined status marker
-	local statusMarker = buffer.readu8(rawData, MARKER_BYTE_POS)
-
-	-- Determine compression and batch status from the marker
-	local isCompressed: boolean
-	local isBatch: boolean
-
-	if statusMarker == MARKER_UNCOMPRESSED_SINGLE then
-		isCompressed = false
-		isBatch = false
-	elseif statusMarker == MARKER_COMPRESSED_SINGLE then
-		isCompressed = true
-		isBatch = false
-	elseif statusMarker == MARKER_UNCOMPRESSED_BATCH then
-		isCompressed = false
-		isBatch = true
-	elseif statusMarker == MARKER_COMPRESSED_BATCH then
-		isCompressed = true
-		isBatch = true
-	else
-		warn("[NetRaySender] Received unknown status marker:", statusMarker)
-		return nil -- Invalid marker
-	end
-
-	if NetRaySender.Config.DebugMode then
-		print(`[NetRaySender] Decoding. Size: {buffer.len(rawData)}, Marker: {statusMarker} (Compressed: {isCompressed}, Batch: {isBatch})`)
-	end
-
-	-- 2. Extract the serialized payload (data after the marker byte)
-	local serializedPayloadBuffer = buffer.create(buffer.len(rawData) - 1)
-	buffer.copy(serializedPayloadBuffer, 0, rawData, 1)
-
-	-- 3. Deserialize the payload
-	local deserializeSuccess, deserializedPayload = pcall(Serializer.Deserialize, serializedPayloadBuffer)
-	if not deserializeSuccess then
-		warn("[NetRaySender] Failed to deserialize payload:", deserializedPayload)
-		return nil
-	end
-
-	local finalData
-	-- 4. Handle decompression if needed
-	if isCompressed then
-		if typeof(deserializedPayload) == "string" then
-			if NetRaySender.Config.DebugMode then
-				print("[NetRaySender] Decompressing payload string...")
+			-- Check 1: Does this key exist in the first element's structure?
+			local baseInfo = initialFieldInfo[key]
+			if not baseInfo then
+				-- Element has a key that was not present in the first element. Structure mismatch.
+				return nil, maxD
 			end
-			local decompressedData = Compressor:Decompress(deserializedPayload)
-			local decompressSuccess = (decompressedData ~= nil)
-			if decompressSuccess then
-				finalData = decompressedData
-				if NetRaySender.Config.DebugMode then
-					print("[NetRaySender] Decompression successful.")
+
+			-- Check 2: Is the value nil? (Still assuming non-nil fields)
+			if value == nil then
+				-- TODO: Revisit nil handling if necessary
+				return nil, maxD -- Fields cannot be nil
+			end
+
+			-- Check 3: Does the base type match the first element's field type?
+			local valueType = typeof(value)
+			if valueType ~= baseInfo.BaseType then
+				-- e.g., field 'x' was a number in element 1 but a string in element 'i'. Structure mismatch.
+				return nil, maxD
+			end
+
+			-- Retrieve analysis data structure for this field to update stats
+			local analysis = fieldAnalysis[key]
+			if not analysis then
+				-- This should technically be impossible if Pass 1 populated correctly for this key
+				error("Internal Error: Field analysis data missing for key: " .. key)
+			end
+
+			-- Update detailed statistics based on the field's BaseType
+			if baseInfo.BaseType == "number" then
+				local numVal = value :: number
+				-- Update min/max values seen so far
+				analysis.numMin = math.min(analysis.numMin or numVal, numVal)
+				analysis.numMax = math.max(analysis.numMax or numVal, numVal)
+				-- Update flag if we encounter a non-integer value
+				if not analysis.numHasNonInt and not isInteger(numVal) then
+					analysis.numHasNonInt = true
 				end
-			else
-				warn("[NetRaySender] Failed to decompress data:", decompressedData)
-				return nil -- Indicate failure
+			elseif baseInfo.BaseType == "Vector3" then
+				local v = value :: Vector3
+				-- Update min/max for each component
+				analysis.v3MinX = math.min(analysis.v3MinX or v.X, v.X)
+				analysis.v3MaxX = math.max(analysis.v3MaxX or v.X, v.X)
+				analysis.v3MinY = math.min(analysis.v3MinY or v.Y, v.Y)
+				analysis.v3MaxY = math.max(analysis.v3MaxY or v.Y, v.Y)
+				analysis.v3MinZ = math.min(analysis.v3MinZ or v.Z, v.Z)
+				analysis.v3MaxZ = math.max(analysis.v3MaxZ or v.Z, v.Z)
+				-- Update float flag if any component is not an integer
+				if not analysis.v3HasFloat and not (isInteger(v.X) and isInteger(v.Y) and isInteger(v.Z)) then
+					analysis.v3HasFloat = true
+				end
+			elseif baseInfo.BaseType == "Vector2" then
+				local v = value :: Vector2
+				-- Update min/max for each component
+				analysis.v2MinX = math.min(analysis.v2MinX or v.X, v.X)
+				analysis.v2MaxX = math.max(analysis.v2MaxX or v.X, v.X)
+				analysis.v2MinY = math.min(analysis.v2MinY or v.Y, v.Y)
+				analysis.v2MaxY = math.max(analysis.v2MaxY or v.Y, v.Y)
+				-- Update float flag if any component is not an integer
+				if not analysis.v2HasFloat and not (isInteger(v.X) and isInteger(v.Y)) then
+					analysis.v2HasFloat = true
+				end
+			elseif baseInfo.BaseType == "CFrame" then
+				local cf = value :: CFrame -- Still only tracking position stats
+				local p = cf.Position :: Vector3
+				-- Update min/max for each position component
+				analysis.cfPosMinX = math.min(analysis.cfPosMinX or p.X, p.X)
+				analysis.cfPosMaxX = math.max(analysis.cfPosMaxX or p.X, p.X)
+				analysis.cfPosMinY = math.min(analysis.cfPosMinY or p.Y, p.Y)
+				analysis.cfPosMaxY = math.max(analysis.cfPosMaxY or p.Y, p.Y)
+				analysis.cfPosMinZ = math.min(analysis.cfPosMinZ or p.Z, p.Z)
+				analysis.cfPosMaxZ = math.max(analysis.cfPosMaxZ or p.Z, p.Z)
+				-- elseif baseInfo.BaseType == "string" then -- No stats to update
+				-- elseif baseInfo.BaseType == "boolean" then -- No stats to update
+				-- elseif baseInfo.BaseType == "Color3" then -- No stats to update (usually fixed size)
+				-- ... etc for other simple types that don't require range analysis
 			end
-		else
-			warn(`[NetRaySender] Compressed marker received but deserialized payload is not a string: {typeof(deserializedPayload)}`)
-			return nil -- Indicate failure
+		end -- End inner loop (pairs over element's keys)
+
+		-- Check 4: Does this element have the exact same number of keys as the first element?
+		-- This catches cases where an element is missing a key found in the first element.
+		if elementKeyCount ~= expectedKeyCount then
+			return nil, maxD -- Key count mismatch. Structure mismatch.
 		end
+	end -- End outer loop (elements 2 to count)
+
+	-- =========================================================================
+	-- Pass 3: Finalize optimal types and build final struct info array
+	-- Use the collected statistics to choose the best (most compact) type for each field.
+	-- =========================================================================
+	local finalStructInfo: { StructFieldInfo } = {} -- Initialize the result array
+
+	-- Iterate through the keys in the order they were found (though final result is sorted)
+	for _, key in ipairs(keyOrder) do
+		local baseInfo = initialFieldInfo[key]
+		local analysis = fieldAnalysis[key]
+
+		-- Start with the initial type identified in Pass 1
+		local finalTypeName: TypeName = baseInfo.InitialTypeName
+		local finalTypeCode: TypeCode? = baseInfo.InitialTypeCode
+		local readerFunc -- To be looked up based on finalTypeName
+		local writerFunc -- To be looked up based on finalTypeName
+
+		-- Refine the type based on collected statistics for optimizable types
+		-- Calls helper functions (assumed to exist) that analyze the stats
+		-- and return the best TypeName and TypeCode (e.g., "Int8", "Float32", "V3Int16").
+
+		if baseInfo.BaseType == "number" then
+			-- Check if analysis data is valid (should always be if logic is correct)
+			if not analysis or analysis.numMin == nil or analysis.numMax == nil then
+				error(string.format("Internal Error: Finalizing number field '%s', but analysis data is incomplete.", key))
+			end
+			-- Find the most compact number type that fits the min/max range and integer status
+			local bestName, bestCode = getBestNumberType(analysis.numMin, analysis.numMax, analysis.numHasNonInt == true)
+			if not bestName then
+				-- The helper function determined no suitable compact type could represent the range/type.
+				return nil, maxD -- Cannot find a suitable compact number type
+			end
+			finalTypeName, finalTypeCode = bestName, bestCode
+
+		elseif baseInfo.BaseType == "Vector3" then
+			if not analysis or analysis.v3MinX == nil then -- Check one representative stat
+				error(string.format("Internal Error: Finalizing Vector3 field '%s', but analysis data is incomplete.", key))
+			end
+			-- Find the most compact Vector3 representation (e.g., V3Int16, V3Float32) based on component ranges/types
+			local bestName, bestCode = getBestVector3Type(analysis :: any) -- Pass the whole analysis struct
+			if not bestName then
+				return nil, maxD -- Cannot find a suitable compact Vector3 type
+			end
+			finalTypeName, finalTypeCode = bestName, bestCode
+
+		elseif baseInfo.BaseType == "Vector2" then
+			if not analysis or analysis.v2MinX == nil then -- Check one representative stat
+				error(string.format("Internal Error: Finalizing Vector2 field '%s', but analysis data is incomplete.", key))
+			end
+			-- Find the most compact Vector2 representation
+			local bestName, bestCode = getBestVector2Type(analysis :: any) -- Pass the whole analysis struct
+			if not bestName then
+				return nil, maxD -- Cannot find a suitable compact Vector2 type
+			end
+			finalTypeName, finalTypeCode = bestName, bestCode
+
+		elseif baseInfo.BaseType == "CFrame" then
+			if not analysis or analysis.cfPosMinX == nil then -- Check one representative stat
+				error(string.format("Internal Error: Finalizing CFrame field '%s', but analysis data is incomplete.", key))
+			end
+			-- Find the most compact CFrame representation (e.g., CFPosOnly, CFSmall) based on position stats (and possibly other factors not tracked here)
+			local bestName, bestCode = getBestCFrameType(analysis :: any) -- Pass the whole analysis struct
+			if not bestName then
+				return nil, maxD -- Cannot find a suitable compact CFrame type
+			end
+			finalTypeName, finalTypeCode = bestName, bestCode
+
+			-- Other types (String, Boolean, Color3, BrickColor, etc.) usually don't have
+			-- further optimization based on content/range in this context.
+			-- Their initial TypeName/TypeCode determined in Pass 1 is typically the final one.
+			-- Add `elseif` blocks here ONLY if specific analysis/optimization is needed for them.
+		end
+
+		-- Fetch the corresponding serialization/deserialization functions for the *finalized* type
+		-- Assuming a 'TypesModule' exists with lookup tables 'Reads' and 'Writes'.
+		readerFunc = TypesModule.Reads[finalTypeName]
+		writerFunc = TypesModule.Writes[finalTypeName]
+
+		-- Validate that handlers and the final type code exist. This is a crucial sanity check.
+		if not readerFunc or not writerFunc then
+			error(string.format("Struct Array: Read/Write handler missing for finalized type '%s' (Key: %s)", finalTypeName, key))
+		end
+		if finalTypeCode == nil then
+			-- This should ideally be caught by the getBest...Type functions returning nil type names if no code exists,
+			-- but double-check here for safety, especially for types not explicitly optimized above.
+			error(string.format("Struct Array: Final TypeCode is missing for finalized type '%s' (Key: %s)", finalTypeName, key))
+		end
+
+		-- Add the finalized field information to the result array
+		table.insert(finalStructInfo, {
+			Name = key,                       -- Name of the field
+			TypeName = finalTypeName,         -- The chosen optimal type name
+			TypeCode = finalTypeCode :: TypeCode, -- The corresponding type code (assert non-nil based on checks)
+			ReadFunc = readerFunc,            -- Function to read this field type from a buffer
+			WriteFunc = writerFunc            -- Function to write this field type to a buffer
+		})
+	end -- End loop through keyOrder
+
+	-- =========================================================================
+	-- Final Step: Sort and Return
+	-- =========================================================================
+
+	-- Sort the final field info alphabetically by field name.
+	-- This ensures a deterministic order for serialization, regardless of
+	-- the order keys might appear in `pairs` iterations.
+	table.sort(finalStructInfo, function(a, b)
+		return a.Name < b.Name
+	end)
+
+	-- Success! Return the array of StructFieldInfo and the maximum depth reached.
+	return finalStructInfo, maxD
+
+end -- End of isStructArrayCandidate function
+
+-- Analyzes data to provide metadata for strategy selection
+analyzeMetadata = function(data: any): ({ [string]: any })
+	local meta = {
+		dataType = typeof(data),
+		isStructArrayCandidate = false,
+		structInfo = nil :: ({ StructFieldInfo }?),
+		maxDepth = 0,
+	}
+
+	if meta.dataType == "table" then
+		meta.structInfo, meta.maxDepth = isStructArrayCandidate(data, 1, DynamicSender.Config)
+		meta.isStructArrayCandidate = (meta.structInfo ~= nil)
 	else
-		-- Not compressed, the deserialized payload is the final data
-		finalData = deserializedPayload
-		if NetRaySender.Config.DebugMode then
-			print("[NetRaySender] Payload was not compressed.")
+		meta.maxDepth = 0
+	end
+	return meta
+end
+
+--==============================================================================
+-- Struct Array Serialization (Optimized: No Field Codes Written/Read)
+--==============================================================================
+writeStructArrayInternal = function(cursor: Cursor, data: { { [string]: any } }, structInfo: { StructFieldInfo })
+	local count = #data; if count > 65535 then error("Struct count > 65k") end; cursor:WriteU2(count); -- Element Count
+	local fieldCount = #structInfo; if fieldCount > 255 then error("Struct fields > 255") end; cursor:WriteU1(fieldCount); -- Field Count
+	local nameTypeCode, nameWriteFunc = TYPE_CODES.String, TypesModule.Writes.String; assert(nameTypeCode and nameWriteFunc, "REQ: String Writer");
+	-- Write structure definition (Name + OPTIMIZED TypeCode)
+	for _, field in ipairs(structInfo) do
+		cursor:WriteU1(nameTypeCode); nameWriteFunc(cursor, field.Name); -- Field Name
+		cursor:WriteU1(field.TypeCode) -- Field *optimized* type from analysis
+	end
+	-- Write element data sequentially without per-field type codes
+	for i = 1, count do local element = data[i]; if typeof(element) ~= "table" then error("Bad struct data") end;
+		for _, field in ipairs(structInfo) do -- Write fields in definition's sorted order
+			local value = element[field.Name];
+			-- Runtime assertion that value isn't nil (should be caught by analysis, but good safety)
+			assert(value ~= nil, "INTERNAL ERROR: Nil value found writing optimized struct array for field " .. field.Name);
+			assert(field.WriteFunc, "Missing WriteFunc: "..field.TypeName);
+			field.WriteFunc(cursor, value) -- Directly call the optimized writer for this field type
+		end
+	end
+end
+
+
+readStructArrayInternal = function(cursor: Cursor): { { [string]: any } }
+	local count = cursor:ReadU2(); local fieldCount = cursor:ReadU1();
+	local structInfo = table.create(fieldCount); -- Store received structure info in order
+	local nameTypeCodeExpected, nameReadFunc = TYPE_CODES.String, TypesModule.Reads.String; assert(nameTypeCodeExpected and nameReadFunc, "REQ: String Reader");
+	-- Read structure definition
+	for i = 1, fieldCount do
+		local readNameCode = cursor:ReadU1(); if readNameCode ~= nameTypeCodeExpected then error("Bad name TC") end;
+		local fieldName = nameReadFunc(cursor);
+		local fieldTypeCode = cursor:ReadU1(); -- Read the OPTIMIZED TypeCode sent by sender
+		local fieldTypeName = BYTE_TO_TYPE_NAME[fieldTypeCode]; if not fieldTypeName then error("Bad field TC "..fieldTypeCode) end;
+		local readerFunc = TypesModule.Reads[fieldTypeName]; assert(readerFunc, "Missing Reader:"..fieldTypeName);
+		-- Store name, resolved type info, and the mandatory reader function
+		structInfo[i] = { Name = fieldName, TypeName = fieldTypeName, TypeCode = fieldTypeCode, ReadFunc = readerFunc } -- No need to store WriteFunc on read side
+	end
+
+	-- Read element data (rely entirely on read structure definition)
+	local resultArray = table.create(count);
+	for i = 1, count do local element = {};
+		for _, field in ipairs(structInfo) do -- Read fields in the exact defined order
+			-- *** REMOVED Per-Field Type Code READ ***
+			assert(field.ReadFunc, "Missing ReadFunc: "..field.TypeName); -- Assert reader exists
+			local value = field.ReadFunc(cursor) -- Directly read value using handler from definition
+			element[field.Name] = value
+		end;
+		resultArray[i] = element
+	end;
+	return resultArray
+end
+
+--==============================================================================
+-- Batching Logic
+--==============================================================================
+
+getOrCreateBatchCursor = function(remote: RemoteEvent): (Cursor, {[Player|string]: boolean})
+	local state = batchState[remote]
+	if not state then
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Create batch ${remote:GetFullName()}`) end
+		state = { Cursor=CursorModule(buffer.create(4096), {}),
+			Targets={}
+		}; 
+		batchState[remote]=state;
+		activeRemotes[remote]=true
+	end
+	return state.Cursor, state.Targets
+end
+
+-- Helper function specifically for handling the server-side sending logic
+local function sendServerBatch(remote: RemoteEvent, buffer: buffer, instances: {Instance}, targets: { [Player | string]: boolean })
+	-- Check if the target is 'all' (broadcast)
+	if targets["all"] then
+		if remote.FireAllClients then
+			-- Fire to all connected clients using the optimized method
+			remote:FireAllClients(buffer, instances)
+			if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Fired All Clients on ${remote:GetFullName()}`) end
+		else
+			-- Warn if the RemoteEvent is missing the necessary method
+			warn(`[DynamicSender WARN] RemoteEvent ${remote:GetFullName()} has no :FireAllClients method.`)
+		end
+		return -- Handled broadcast case, no need to check specific players
+	end
+
+	-- Filter specific Player targets from the 'targets' map
+	local playersToSendTo = {}
+	for targetOrKey, _ in pairs(targets) do
+		-- Ensure it's an Instance and specifically a Player
+		-- This filters out any non-player keys or the "all" key if present
+		if typeof(targetOrKey) == "Instance" and targetOrKey:IsA("Player") then
+			table.insert(playersToSendTo, targetOrKey)
 		end
 	end
 
-	-- 5. Return based on batch status
-	if isBatch then
-		if NetRaySender.Config.DebugMode then
-			print("[NetRaySender] Decoded a batch.")
+	-- Proceed only if we found specific, valid player targets
+	if #playersToSendTo > 0 then
+		local successes = 0
+		local totalTargets = #playersToSendTo
+
+		-- Check if the FireClient method exists *before* looping for efficiency
+		if remote.FireClient then
+			for _, player in ipairs(playersToSendTo) do
+				-- Double-check if the player is still connected before firing
+				if player.Parent then
+					-- Attempt to fire the event for this specific player
+					remote:FireClient(player, buffer, instances)
+					successes += 1
+				elseif DynamicSender.Config.DebugMode then
+					-- Log if we skipped a player because they disconnected
+					print(`[DynamicSender DBG] Skipped sending to disconnected player ${player.Name} on ${remote:GetFullName()}`)
+				end
+			end
+		else
+			-- Warn if the RemoteEvent is missing the necessary method for specific sends
+			warn(`[DynamicSender WARN] RemoteEvent ${remote:GetFullName()} has no :FireClient method. Cannot send to specific players.`)
+			-- Ensure success count reflects reality if we couldn't even attempt sends
+			successes = 0
 		end
-		-- The finalData *is* the array of events `{event1, event2,...}`.
-		if typeof(finalData) == "table" then
+
+		-- Optional: Log if not all intended targets received the message (likely due to disconnects)
+		if successes < totalTargets and DynamicSender.Config.DebugMode then
+			warn(`[DynamicSender WARN] Successfully sent to ${successes}/${totalTargets} specific targets on ${remote:GetFullName()}. Others might be disconnected.`)
+		elseif DynamicSender.Config.DebugMode then
+			print(`[DynamicSender DBG] Sent batch to ${successes}/${totalTargets} specific targets on ${remote:GetFullName()}`)
+		end
+
+	elseif DynamicSender.Config.DebugMode then
+		-- Avoid logging "no valid targets" if it was *only* an "all" batch (handled above).
+		-- This checks if the 'targets' table contained *only* the "all" key.
+		local hasOnlyAll = targets["all"] and next(targets, "all") == nil
+		if not hasOnlyAll then
+			print(`[DynamicSender DBG] No valid player targets found in batch state for ${remote:GetFullName()} after filtering.`)
+		end
+	end
+end
+
+-- Main batch processing function
+processFrameBatches = function(triggeredRemote: RemoteEvent?)
+	local remotesToActuallyProcess: {[RemoteEvent]: boolean} = {}
+
+	-- If called by a trigger, add that specific remote
+	if triggeredRemote then
+		remotesToActuallyProcess[triggeredRemote] = true
+		if activeRemotes[triggeredRemote] then
+			activeRemotes[triggeredRemote] = nil
+		end
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] processFrameBatches triggered directly for ${triggeredRemote:GetFullName()}`) end
+	end
+
+	-- Also process any remotes added normally via Heartbeat cycle
+	if next(activeRemotes) then
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] processFrameBatches processing activeRemotes`) end
+		for remote, _ in pairs(activeRemotes) do
+			remotesToActuallyProcess[remote] = true -- Add normally activated remotes
+		end
+		activeRemotes = {} -- Clear the global active list
+	end
+
+	-- Early exit if there's nothing to process (neither triggered nor active)
+	if not next(remotesToActuallyProcess) then
+		if DynamicSender.Config.DebugMode and not triggeredRemote then print("[DynamicSender DBG] processFrameBatches - No active remotes, exiting.") end
+		return
+	end
+
+	if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] processFrameBatches - Processing ${table.maxn(remotesToActuallyProcess)} remote(s)`) end
+
+
+	-- Iterate through the combined list of remotes that need processing
+	for remote, _ in pairs(remotesToActuallyProcess) do
+		-- Validate the RemoteEvent instance itself (redundant check but safe)
+		if not remote then
+			warn("[DynamicSender WARN] Nil remote key found in processing list. Skipping.")
+			continue
+		end
+
+		local state = batchState[remote]
+
+		-- Skip this remote if no state or buffer is empty
+		-- This check is still important even if triggered, state might have been lost?
+		if not state or state.Cursor.Index == 0 then
+			if state then state.Targets = {} end
+			if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Skipping ${remote:GetFullName()} - No state or empty buffer.`) end
+			continue
+		end
+
+		-- Retrieve the accumulated data and target information
+		local cursor = state.Cursor
+		local targets = state.Targets
+		local finalBuffer = cursor:Truncate()
+		local finalInstances = cursor.Instances
+		local bufferLen = buffer.len(finalBuffer)
+
+		if DynamicSender.Config.DebugMode then
+			local targetCount = 0; for _ in pairs(targets) do targetCount += 1 end
+			print(`[DynamicSender DBG] Processing batch for ${remote:GetFullName()}. Size: ${bufferLen}, Instances: {#finalInstances}, Target Keys: ${targetCount}`)
+		end
+
+		-- === Network Sending Logic ===
+		if isServer then
+			sendServerBatch(remote, finalBuffer, finalInstances, targets)
+		elseif isClient then
+			if remote.FireServer then
+				remote:FireServer(finalBuffer, finalInstances)
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Fired Server on ${remote:GetFullName()}`) end
+			else
+				warn(`[DynamicSender WARN] RemoteEvent ${remote:GetFullName()} has no :FireServer method.`)
+			end
+		end
+		-- ============================
+
+		-- Cleanup: Reset the cursor and targets map for this remote
+		cursor:Clear()
+		state.Targets = {}
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Cleared state for ${remote:GetFullName()}`) end
+	end
+end
+
+
+--==============================================================================
+-- Public API
+--==============================================================================
+
+function DynamicSender:Send(remote: RemoteEvent, data: any, target: Player?, options: any)
+	if not remote then warn("[DynamicSender ERR] RemoteEvent is nil.") return end
+	if isClient and target then warn("[DynamicSender WARN] Target parameter ignored from client.") target = nil end
+	if isServer and target and not target:IsA("Player") then warn("[DynamicSender ERR] Target must be Player instance or nil.") return end
+	
+	if not data then
+		print("no data direct send")
+		if isClient then
+			remote:FireServer()
+		else
+			remote:FireClient(target)
+		end
+	end
+
+	local cursor, targets = getOrCreateBatchCursor(remote)
+	local meta = analyzeMetadata(data);
+
+	local strategy: number
+	local payload: any
+	local structInfo: { StructFieldInfo }? = nil 
+
+	-- Select Strategy
+	if meta.isStructArrayCandidate and meta.structInfo then
+		strategy = STRATEGY_STRUCT_ARRAY
+		payload = data
+		structInfo = meta.structInfo
+		metrics.structArrayPayloads += 1
+		if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Send Strategy: Struct Array") end
+	else
+		strategy = STRATEGY_LZ4
+		local lz4Ok, lz4Payload = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
+		if not lz4Ok or typeof(lz4Payload) ~= "string" then warn(`[DynamicSender ERR] LZ4 Compress fail: ${lz4Payload}. Msg cancelled.`); metrics.errors+=1; return end
+		payload = lz4Payload :: string -- Assert type after check
+		metrics.lz4Payloads += 1
+		if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Send Strategy: LZ4") end
+	end
+
+	-- Write message (Strategy + Target + Payload) to batch cursor
+	local writeOk, writeErr = pcall(function()
+		cursor:WriteU1(strategy) -- Strategy Marker
+		if isServer then writeTargetInfoInternal(cursor, target) end -- Target Info
+
+		local startTime = os.clock()
+		-- Payload Writing
+		if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string)
+		elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "Send sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo)
+		else error("Bad Send Strat:"..strategy, 0) end
+		local duration = os.clock() - startTime
+
+		-- Update Metrics & Debug Log
+		metrics.serializeCount += 1; metrics.totalSerializeTime += duration
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Added msg ${remote:GetFullName()}. Strat:${strategy} Tgt:${target or "all"} Time:${string.format("%.5f", duration)}`) end;
+		if isServer then targets[target or "all"] = true end -- Record target *after* successful write
+	end)
+
+	if not writeOk then warn(`[DynamicSender ERR] Write Message fail ${remote:GetFullName()}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1 end
+
+	-- Check Flush Trigger
+	if DynamicSender.Config.MaxBatchSizeTrigger > 0 and cursor.Index > DynamicSender.Config.MaxBatchSizeTrigger then
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Size ${cursor.Index} / ${DynamicSender.Config.MaxBatchSizeTrigger} -> Flush Trigger for ${remote:GetFullName()}`) end
+		processFrameBatches(remote)
+	end
+end
+
+
+function DynamicSender:SendToMany(remote: RemoteEvent, data: any, targets: { Player })
+	if not isServer then warn("[DynamicSender SndM ERR] Server only.") return end
+	if not remote then warn("[DynamicSender SndM ERR] RE nil.") return end
+	if not targets or #targets == 0 then warn("[DynamicSender SndM ERR] Targets empty.") return end
+
+	local successfullyQueued = 0
+
+	for _, playerTarget in ipairs(targets) do
+		if playerTarget and playerTarget:IsA("Player") and playerTarget.Parent then
+			-- Get the shared batch cursor and target list for this remote event
+			-- This might be called multiple times if the size trigger flushes mid-loop
+			local cursor, batchTargets = getOrCreateBatchCursor(remote)
+
+			local meta = analyzeMetadata(data) -- Analyze for each target (needed for strategy selection)
+
+			local strategy: number
+			local payload: any
+			local structInfo: { StructFieldInfo }? = nil
+
+			-- Select Strategy (Potentially done repeatedly if LZ4)
+			if meta.isStructArrayCandidate and meta.structInfo then
+				strategy = STRATEGY_STRUCT_ARRAY
+				payload = data
+				structInfo = meta.structInfo
+				-- metrics.structArrayPayloads incremented below after successful write
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG Target ${playerTarget.Name}] Strat: Struct[]`) end
+			else
+				strategy = STRATEGY_LZ4
+				-- LZ4 Compression happens per target if this path is taken
+				local lz4Ok, lz4Payload = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
+				if not lz4Ok or typeof(lz4Payload) ~= "string" then
+					warn(`[DynamicSender SndM ERR Target ${playerTarget.Name}] LZ4 Compress fail: ${lz4Payload}. Msg cancelled for this target.`); metrics.errors+=1;
+					continue -- Skip this target
+				end
+				payload = lz4Payload :: string
+				-- metrics.lz4Payloads incremented below after successful write
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG Target ${playerTarget.Name}] Strat: LZ4`) end
+			end
+
+			-- Write message (Strategy + Specific Target + Payload) to batch cursor
+			local writeOk, writeErr = pcall(function()
+				cursor:WriteU1(strategy) -- Strategy Marker
+				-- Write the SPECIFIC player target using the Instance handler
+				writeTargetInfoInternal(cursor, playerTarget)
+
+				local startTime = os.clock()
+				-- Payload Writing
+				if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string)
+				elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "SndM Batch sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo)
+				else error("SndM Batch Bad strat:"..strategy, 0) end
+				local duration = os.clock() - startTime
+
+				-- Update Metrics & Debug Log
+				metrics.serializeCount += 1; metrics.totalSerializeTime += duration
+				if strategy == STRATEGY_LZ4 then metrics.lz4Payloads += 1 else metrics.structArrayPayloads += 1 end -- Increment correct payload type
+
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Added msg to batch for ${playerTarget.Name} on ${remote:GetFullName()}. Strat:${strategy} Time:${string.format("%.5f", duration)}`) end;
+
+				-- Record target in the batch state *after* successful write
+				batchTargets[playerTarget] = true
+				successfullyQueued += 1
+			end)
+
+			if not writeOk then
+				warn(`[DynamicSender SndM ERR] Write Message fail for ${playerTarget.Name} on ${remote:GetFullName()}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1
+				-- Don't check flush trigger if write failed for this target
+				continue
+			end
+
+			-- Check Flush Trigger *after each successful write*
+			if DynamicSender.Config.MaxBatchSizeTrigger > 0 and cursor.Index > DynamicSender.Config.MaxBatchSizeTrigger then
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Size ${cursor.Index} / ${DynamicSender.Config.MaxBatchSizeTrigger} -> Flush Trigger during SendToMany`) end
+				processFrameBatches() -- Flush the shared buffer
+			end
+
+		else
+			warn(`[DynamicSender SendToMany WARN] Invalid or disconnected target in list: {playerTarget}`)
+		end
+	end -- End of the for loop over targets
+
+	if DynamicSender.Config.DebugMode then
+		print(`[DynamicSender DBG] SendToMany (Batched): Finished queuing messages for {successfullyQueued}/{#targets} targets. Actual send deferred to batch processing.`)
+	end
+
+end
+
+function DynamicSender:DecodeReceivedData(rawDataBuffer: buffer, rawInstances: {Instance}?): {any}
+	if typeof(rawDataBuffer)~="buffer" then
+		if rawDataBuffer == nil then
+			return {}
+		end
+		warn("[DynamicSender ERR] Buffer expected")
+		metrics.decodeErrors+=1
+		return{}
+	end
+	
+	if rawInstances and typeof(rawInstances)~="table" then warn("[DynamicSender WARN] Instances !table");rawInstances={} end;
+
+	local decodedMessages={}; local startTime=os.clock(); local cursor=CursorModule(rawDataBuffer, rawInstances or {});
+
+	while cursor.Index < buffer.len(rawDataBuffer) do
+		local messageStartIndex = cursor.Index;
+		local success, messageData = pcall(function() -- Pcall per message
+			local strategy = cursor:ReadU1(); if not strategy then error("Read strat marker fail",0) end
+			local _targetInfo; if isClient then _targetInfo = readTargetInfoInternal(cursor) end -- Read Target info
+
+			local finalData: any; -- To hold final Luau value
+			if strategy == STRATEGY_LZ4 then -- Handle LZ4 path
+				local pTC=cursor:ReadU1(); if pTC ~= TYPE_CODES.Binary then error("Exp Bin TC")end;
+				local reader=TypesModule.Reads.Binary; if not reader then error("No Bin Reader")end;
+				local sPayload=reader(cursor); if typeof(sPayload)~="string" then error("Bin read !str")end;
+				local lzOk,lzResult = pcall(LZ4_Lib.Decompress,LZ4_Lib,sPayload);
+				if not lzOk then warn(`[DynamicSender ERR] LZ4 Dec:${lzResult}`); error("LZ4 Dec fail",0) end;
+				finalData=lzResult
+
+			elseif strategy == STRATEGY_STRUCT_ARRAY then -- Handle Struct Array path
+				finalData = readStructArrayInternal(cursor)
+			else
+				error("Unknown message strategy marker: "..strategy, 0) -- Unknown strategy
+			end
 			return finalData
-		else
-			warn("[NetRaySender] Batch marker indicated but final data is not a table:", typeof(finalData))
-			return nil -- Error case
-		end
-	else
-		-- Not a batch, return the single item
-		if NetRaySender.Config.DebugMode then
-			print("[NetRaySender] Decoded single item.")
-		end
-		return finalData
-	end
-end
-
---[[
-    Processes a batch of events for a specific remote.
-]]
-processBatch = function(remote: RemoteEvent)
-	local queue = batchQueues[remote]
-	if not queue or #queue == 0 then
-		batchTimers[remote] = nil
-		batchCreationTimes[remote] = nil
-		return
-	end
-
-	local eventsToProcess = queue -- Get a reference before clearing
-	batchQueues[remote] = {} -- Clear queue immediately
-	batchCreationTimes[remote] = os.clock()
-	batchTimers[remote] = nil -- Clear timer
-
-	if NetRaySender.Config.DebugMode then
-		print(`[NetRaySender] Processing batch for {remote:GetFullName()}. Size: {#eventsToProcess}`)
-	end
-
-	-- Optimization: Handle single-item "batch" queue directly
-	if #eventsToProcess == 1 then
-		local event = eventsToProcess[1]
-		-- Prepare single item, marked explicitly as NOT a batch
-		local preparedData = prepareDataForSend(event.data, false, NetRaySender.Config.ForceCompressSingle) -- isBatch = false
-		if preparedData then
-			if event.target then
-				pcall(remote.FireClient, remote, event.target, preparedData)
-			elseif remote.FireAllClients then
-				pcall(remote.FireAllClients, remote, preparedData)
-			else
-				warn("[NetRaySender] Cannot FireAllClients on", remote, "- Target was nil but method doesn't exist.")
-			end
-		else
-			warn("[NetRaySender] Failed to prepare single event data from batch queue:", event.data)
-		end
-		return
-	end
-
-	-- Group events by target
-	local eventsByTarget = {}
-	for _, event in ipairs(eventsToProcess) do
-		local targetKey = event.target or "all"
-		if not eventsByTarget[targetKey] then
-			eventsByTarget[targetKey] = {}
-		end
-		table.insert(eventsByTarget[targetKey], event.data)
-	end
-
-	-- Process each target group
-	for targetKey, dataItems in pairs(eventsByTarget) do
-		-- Create the batch payload directly as an array of the data items
-		local batchPayload = dataItems -- The array itself IS the payload
-
-		-- Prepare the *entire* batch payload, marked explicitly AS a batch
-		local preparedBatchData = prepareDataForSend(batchPayload, true, NetRaySender.Config.ForceCompressBatches) -- isBatch = true
-
-		if preparedBatchData then
-			if targetKey == "all" then
-				if remote.FireAllClients then
-					pcall(remote.FireAllClients, remote, preparedBatchData)
-					if NetRaySender.Config.DebugMode then
-						print(`[NetRaySender] Fired batch to all clients. Final Size: {buffer.len(preparedBatchData)} bytes`)
-					end
-				else
-					warn("[NetRaySender] Cannot FireAllClients on", remote, "- Target key was 'all' but method doesn't exist.")
-				end
-			else
-				local targetPlayer = targetKey :: Player
-				if targetPlayer and targetPlayer.Parent then
-					pcall(remote.FireClient, remote, targetPlayer, preparedBatchData)
-					if NetRaySender.Config.DebugMode then
-						print(`[NetRaySender] Fired batch to {targetPlayer.Name}. Final Size: {buffer.len(preparedBatchData)} bytes`)
-					end
-				else
-					if NetRaySender.Config.DebugMode then
-						print(`[NetRaySender] Skipped firing batch to target {targetKey} - Player likely left.`)
-					end
-				end
-			end
-		else
-			warn("[NetRaySender] Failed to prepare batch data for target:", targetKey)
-		end
-	end
-end
-
-
---[[
-    Send data using the most efficient method (serialization + optional compression).
-    Handles batching automatically if enabled.
-]]
-function NetRaySender:Send(remote: RemoteEvent, data: any, target: Player?, options: { noBatch: boolean? }?)
-	if not remote then
-		warn("[NetRaySender] Cannot send: RemoteEvent is nil.")
-		return
-	end
-
-	local forceImmediate = options and options.noBatch == true
-	local canBatch = NetRaySender.Config.BatchingEnabled and not forceImmediate
-
-	-- Send immediately if batching disabled, forced, or target is 'all' without FireAllClients support
-	if not canBatch or (target == nil) then
-		if NetRaySender.Config.DebugMode then
-			print(`[NetRaySender] Sending immediately. Reason: { (not canBatch and 'No Batching') or 'Target All/No FireAllClients Support' }`)
-		end
-		-- Prepare single item, marked as NOT a batch
-		local preparedData = prepareDataForSend(data, false, NetRaySender.Config.ForceCompressSingle) -- isBatch = false
-		if preparedData then
-			if RunService:IsClient() then
-				remote:FireServer(preparedData)
-			else
-				if target then
-					remote:FireClient(target, preparedData)
-				else
-					remote:FireAllClients(preparedData)
-				end
-			end
-		else
-			warn("[NetRaySender] Failed to prepare data for immediate send:", data)
-		end
-		return
-	end
-
-	-- --- Batching Logic ---
-	local queue = batchQueues[remote]
-	if not queue then
-		queue = {}
-		batchQueues[remote] = queue
-		batchCreationTimes[remote] = os.clock()
-		if NetRaySender.Config.DebugMode then
-			print(`[NetRaySender] Created new batch queue for {remote:GetFullName()}`)
-		end
-	end
-
-	table.insert(queue, { data = data, target = target })
-	if NetRaySender.Config.DebugMode then
-		print(`[NetRaySender] Added event to batch queue for {remote:GetFullName()}. Current size: {#queue}`)
-	end
-
-
-	-- Start/Check Timers
-	if not batchTimers[remote] then
-		if NetRaySender.Config.DebugMode then
-			print(`[NetRaySender] Starting batch timer for {remote:GetFullName()}`)
-		end
-		batchTimers[remote] = task.delay(NetRaySender.Config.BatchInterval, function()
-			if batchQueues[remote] then
-				processBatch(remote)
-			else
-				batchTimers[remote] = nil -- Clear self if queue disappeared
-			end
 		end)
-	end
 
-	if #queue >= NetRaySender.Config.MaxBatchSize then
-		if NetRaySender.Config.DebugMode then
-			print(`[NetRaySender] Batch full for {remote:GetFullName()}. Processing immediately.`)
+		if success then table.insert(decodedMessages,messageData); metrics.deserializeCount+=1
+		else warn(`[DynamicSender ERR] Dec fail @${messageStartIndex}: ${tostring(messageData)}`); metrics.errors+=1; metrics.decodeErrors+=1; warn("[DynamicSender ERR] Stop batch dec."); break -- Stop on decode error
 		end
-		if batchTimers[remote] then
-			task.cancel(batchTimers[remote])
-			-- No need to nil here, processBatch will clear it
-		end
-		processBatch(remote) -- This clears the timer reference
 	end
+	metrics.totalDeserializeTime+=(os.clock()-startTime); if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Decode done. Msgs:{#decodedMessages}")end; return decodedMessages
 end
 
---[[
-    Send the same data to multiple specific targets efficiently.
-]]
-function NetRaySender:SendToMany(remote: RemoteEvent, data: any, targets: { Player })
-	if not remote then
-		warn("[NetRaySender] Cannot SendToMany: RemoteEvent is nil.")
-		return
-	end
-	if not targets or #targets == 0 then
-		warn("[NetRaySender] Cannot SendToMany: Targets list is empty or nil.")
-		return
-	end
+--==============================================================================
+-- Utilities
+--==============================================================================
 
-	-- Prepare single item data once, marked as NOT batch
-	local preparedData = prepareDataForSend(data, false, NetRaySender.Config.ForceCompressSingle) -- isBatch = false
-	if not preparedData then
-		warn("[NetRaySender] Failed to prepare data for SendToMany:", data)
-		return
-	end
-
-	if NetRaySender.Config.DebugMode then
-		print(`[NetRaySender] Sending to { #targets } targets via SendToMany.`)
-	end
-
-	for _, target in ipairs(targets) do
-		if target and target.Parent then
-			pcall(remote.FireClient, remote, target, preparedData)
-		end
-	end
+function DynamicSender.GetMetrics():{[string]:number}
+	local copy = {}
+	for k, v in pairs(metrics) do copy[k] = v end
+	local avgS = 0; if metrics.serializeCount > 0 then avgS = metrics.totalSerializeTime / metrics.serializeCount end
+	local avgD = 0; if metrics.deserializeCount > 0 then avgD = metrics.totalDeserializeTime / metrics.deserializeCount end
+	copy.avgSerializeTime = avgS
+	copy.avgDeserializeTime = avgD
+	return copy
 end
 
---[[
-    Flush all pending batches immediately for all remotes.
-]]
-function NetRaySender:FlushBatches()
-	if NetRaySender.Config.DebugMode then
-		print("[NetRaySender] Flushing all batches...")
-	end
-
-	local remotesToProcess = {}
-	for remote, timer in pairs(batchTimers) do
-		task.cancel(timer)
-		if not table.find(remotesToProcess, remote) then
-			table.insert(remotesToProcess, remote)
-		end
-	end
-	batchTimers = {}
-
-	for remote, queue in pairs(batchQueues) do
-		if #queue > 0 and not table.find(remotesToProcess, remote) then
-			table.insert(remotesToProcess, remote)
-		end
-	end
-
-	for _, remote in ipairs(remotesToProcess) do
-		if batchQueues[remote] and #batchQueues[remote] > 0 then
-			if NetRaySender.Config.DebugMode then
-				print(`[NetRaySender] Flushing batch for {remote:GetFullName()}`)
-			end
-			processBatch(remote) -- This clears the queue internally
-		end
-	end
-
-	batchQueues = {}
-	batchCreationTimes = {}
-
-	if NetRaySender.Config.DebugMode then
-		print("[NetRaySender] Batch flush complete.")
-	end
+function DynamicSender.ResetMetrics()
+	for k,_ in pairs(metrics) do metrics[k] = 0 end
+	metrics.totalSerializeTime = 0; metrics.totalDeserializeTime = 0;
 end
 
+function DynamicSender:FlushBatches()
+	if DynamicSender.Config.DebugMode then print("[DynamicSender] Manual flush.") end
+	processFrameBatches()
+end
+
+--==============================================================================
 -- Initialization
+--==============================================================================
 
--- Background task to enforce MaxBatchWait
-if NetRaySender.Config.BatchingEnabled then
-	task.spawn(function()
-		while true do
-			local waitTime = NetRaySender.Config.MaxBatchWait
-			task.wait(waitTime)
+if not runServiceConnection then
+	runServiceConnection = RunService.Heartbeat:Connect(processFrameBatches)
+	if DynamicSender.Config.DebugMode then print("[DynamicSender] Batch processing connected.") end
+end
 
-			local currentTime = os.clock()
-			local remotesToProcess = {}
-
-			-- Collect remotes that need processing first
-			for remote, creationTime in pairs(batchCreationTimes) do
-				-- Check queue exists, has items, NO active timer, and time expired
-				if batchQueues[remote] and #batchQueues[remote] > 0 and not batchTimers[remote] then
-					if (currentTime - creationTime) >= NetRaySender.Config.MaxBatchWait then
-						table.insert(remotesToProcess, remote)
-					end
-				end
-			end
-
-			-- Process the collected remotes
-			for _, remote in ipairs(remotesToProcess) do
-				-- Double-check conditions before processing
-				if batchQueues[remote] and #batchQueues[remote] > 0 and not batchTimers[remote] then
-					if NetRaySender.Config.DebugMode then
-						print(`[NetRaySender] Max wait time reached for {remote:GetFullName()}. Processing batch.`)
-					end
-					processBatch(remote)
-				end
-			end
-		end
+if isServer then
+	game:BindToClose(function() -- Correctly ended function scope
+		warn("[DynamicSender] Closing, flushing batches...")
+		pcall(processFrameBatches)
+		task.wait(0.1)
+		if runServiceConnection then runServiceConnection:Disconnect(); runServiceConnection = nil end
+		warn("[DynamicSender] Shutdown flush complete.")
 	end)
 end
 
--- Server-side shutdown handler
-if RunService:IsServer() then
-	game:BindToClose(function()
-		if NetRaySender then -- Check if module hasn't been destroyed
-			warn("[NetRaySender] Game closing. Flushing remaining batches...")
-			NetRaySender:FlushBatches()
-			task.wait(0.1) -- Short wait to allow network flush attempt
-		end
-	end)
-end
-
-return NetRaySender
+return DynamicSender

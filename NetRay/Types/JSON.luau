@@ -1,4 +1,7 @@
 --!strict
+--!optimize 2
+--!native
+
 --[[
 	Serializes/Deserializes JSON-compatible Luau values using a Cursor.
 
