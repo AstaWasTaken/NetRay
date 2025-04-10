@@ -3,7 +3,7 @@
 --!native
 
 --[[
-    DynamicSender Module (v1.2.8 - Standard Formatting)
+    DynamicSender Module (v1.2.8)
 
     Implements dynamic strategy selection (LZ4 or Struct Array) for serialization.
     Handles frame-based batching for network efficiency.
@@ -64,17 +64,18 @@ type DynamicSenderMetrics = {
 	avgDeserializeTime: number,
 }
 
+type SendOptions = {
+	batchable: boolean, -- If false, sends immediately bypassing the batcher
+	[string]: any -- Allow other keys
+}
+
 -- Type definition for the DynamicSender module export
 export type DynamicSenderModule = {
 	VERSION: string,
 	Config: DynamicSenderConfig,
-
-	-- Core Methods
-	Send: (self: DynamicSenderModule, remote: RemoteEvent, data: any, target: Player?, options: any?) -> (),
-	SendToMany: (self: DynamicSenderModule, remote: RemoteEvent, data: any, targets: { Player }) -> (), -- Server only
-	DecodeReceivedData: (self: DynamicSenderModule, rawDataBuffer: buffer, rawInstances: {Instance}?) -> {any}, -- Returns array of decoded messages
-
-	-- Utility/Lifecycle Methods
+	Send: (self: DynamicSenderModule, remote: RemoteEvent, data: any, target: Player?, options: SendOptions) -> (), -- Added options
+	SendToMany: (self: DynamicSenderModule, remote: RemoteEvent, data: any, targets: { Player }, options: SendOptions) -> (), -- Added options
+	DecodeReceivedData: (self: DynamicSenderModule, rawDataBuffer: buffer, rawInstances: {Instance}?) -> {any},
 	GetMetrics: (self: DynamicSenderModule) -> DynamicSenderMetrics,
 	ResetMetrics: (self: DynamicSenderModule) -> (),
 	FlushBatches: (self: DynamicSenderModule) -> (),
@@ -968,6 +969,45 @@ readStructArrayInternal = function(cursor: Cursor): { { [string]: any } }
 	return resultArray
 end
 
+-- Corrected Helper Function: Serialize a single message
+local function _serializeSingleMessage(strategy: number, target: Player?, payload: any, structInfo: { StructFieldInfo }?): (buffer?, {Instance}?)
+	-- Creates a temporary cursor/buffer just for this one message
+
+	-- Capture results directly from pcall
+	local success, result_or_err, instances_or_nil -- Use multiple vars to capture pcall results
+
+	-- The anonymous function *must* return the values correctly for pcall
+	success, result_or_err, instances_or_nil = pcall(function()
+		local tempBuffer = buffer.create(1024)
+		local instances: {Instance} = {}
+		local cursor = CursorModule(tempBuffer, instances)
+
+		cursor:WriteU1(strategy)
+		if isServer then writeTargetInfoInternal(cursor, target) end
+
+		if strategy == STRATEGY_LZ4 then
+			writeBinaryPayloadInternal(cursor, payload::string)
+		elseif strategy == STRATEGY_STRUCT_ARRAY then
+			assert(structInfo, "SingleMsg sInfo nil")
+			writeStructArrayInternal(cursor, payload::{any}, structInfo)
+		else
+			error("Bad Send Strat:"..strategy, 0)
+		end
+
+		-- Return the two values separately
+		return cursor:Truncate(), instances
+	end)
+
+	if success then
+		-- pcall returned true, result_or_err is the buffer, instances_or_nil is the instances table
+		return result_or_err :: buffer?, instances_or_nil :: {Instance}? -- Return directly, adding casts if needed
+	else
+		-- pcall returned false, result_or_err contains the error message/object
+		warn(`[DynamicSender ERR] Failed to serialize single message: ${result_or_err}`)
+		return nil, nil -- Return nils on failure
+	end
+end
+
 --==============================================================================
 -- Batching Logic
 --==============================================================================
@@ -1137,128 +1177,181 @@ end
 --==============================================================================
 -- Public API
 --==============================================================================
-
-function DynamicSender:Send(remote: RemoteEvent, data: any, target: Player?, options: any)
+function DynamicSender:Send(remote: RemoteEvent, data: any, target: Player?, options: SendOptions?)
 	if not remote then warn("[DynamicSender ERR] RemoteEvent is nil.") return end
 	if isClient and target then warn("[DynamicSender WARN] Target parameter ignored from client.") target = nil end
 	if isServer and target and not target:IsA("Player") then warn("[DynamicSender ERR] Target must be Player instance or nil.") return end
-	
-	if not data then
-		print("no data direct send")
-		if isClient then
-			remote:FireServer()
-		else
-			remote:FireClient(target)
-		end
-	end
+	options = options or {} -- Ensure options table exists
 
+	-- == Direct Send Logic ==
+	if options.batchable == false then
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Send Immediate ${remote:GetFullName()} Tgt:${target or "all"}`) end
+		metrics.serializeCount += 1 -- Count as a serialize operation
+		local startTime = os.clock()
+		-- 1. Analyze & Select Strategy
+		local meta = analyzeMetadata(data)
+		local strategy: number
+		local payload: any
+		local structInfo: { StructFieldInfo }? = nil
+		if meta.isStructArrayCandidate and meta.structInfo then
+			strategy = STRATEGY_STRUCT_ARRAY; payload = data; structInfo = meta.structInfo; metrics.structArrayPayloads += 1
+		else
+			strategy = STRATEGY_LZ4
+			local lz4Ok, lz4Payload = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
+			if not lz4Ok or typeof(lz4Payload) ~= "string" then warn(`[DynamicSender ERR] Send Immediate LZ4 Fail: ${lz4Payload}. Msg Cancelled.`); metrics.errors+=1; return end
+			payload = lz4Payload :: string; metrics.lz4Payloads += 1
+		end
+		-- 2. Serialize the single message
+		local messageBuffer, messageInstances = _serializeSingleMessage(strategy, target, payload, structInfo)
+		metrics.totalSerializeTime += (os.clock() - startTime)
+		-- 3. Fire Immediately if serialization succeeded
+		if messageBuffer then
+			metrics.sendErrors += 1 -- Increment potential send error count before attempting
+			local fireOk, fireErr = pcall(function()
+				if isServer then
+					if target then remote:FireClient(target, messageBuffer, messageInstances)
+					else remote:FireAllClients(messageBuffer, messageInstances) end
+				else -- isClient
+					remote:FireServer(messageBuffer, messageInstances)
+				end
+			end)
+			if fireOk then metrics.sendErrors -= 1 end -- Decrement if send succeeded
+			if not fireOk then warn(`[DynamicSender ERR] Send Immediate Fire Failed: ${fireErr}`); metrics.errors+=1 end
+		else
+			metrics.errors+=1; -- Serialization failed
+		end
+		return -- Exit function, batching bypassed
+	end
+	-- == End Direct Send Logic ==
+
+
+	-- == Existing Batching Logic ==
 	local cursor, targets = getOrCreateBatchCursor(remote)
 	local meta = analyzeMetadata(data);
 
 	local strategy: number
 	local payload: any
-	local structInfo: { StructFieldInfo }? = nil 
+	local structInfo: { StructFieldInfo }? = nil
 
 	-- Select Strategy
 	if meta.isStructArrayCandidate and meta.structInfo then
-		strategy = STRATEGY_STRUCT_ARRAY
-		payload = data
-		structInfo = meta.structInfo
-		metrics.structArrayPayloads += 1
-		if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Send Strategy: Struct Array") end
+		strategy = STRATEGY_STRUCT_ARRAY; payload = data; structInfo = meta.structInfo; -- Counted after write
 	else
 		strategy = STRATEGY_LZ4
 		local lz4Ok, lz4Payload = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
 		if not lz4Ok or typeof(lz4Payload) ~= "string" then warn(`[DynamicSender ERR] LZ4 Compress fail: ${lz4Payload}. Msg cancelled.`); metrics.errors+=1; return end
-		payload = lz4Payload :: string -- Assert type after check
-		metrics.lz4Payloads += 1
-		if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Send Strategy: LZ4") end
+		payload = lz4Payload :: string; -- Counted after write
 	end
 
 	-- Write message (Strategy + Target + Payload) to batch cursor
 	local writeOk, writeErr = pcall(function()
-		cursor:WriteU1(strategy) -- Strategy Marker
-		if isServer then writeTargetInfoInternal(cursor, target) end -- Target Info
+		cursor:WriteU1(strategy)
+		if isServer then writeTargetInfoInternal(cursor, target) end
 
 		local startTime = os.clock()
 		-- Payload Writing
-		if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string)
-		elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "Send sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo)
+		if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string); metrics.lz4Payloads += 1;
+		elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "Send Batch sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo); metrics.structArrayPayloads += 1;
 		else error("Bad Send Strat:"..strategy, 0) end
 		local duration = os.clock() - startTime
 
 		-- Update Metrics & Debug Log
 		metrics.serializeCount += 1; metrics.totalSerializeTime += duration
-		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Added msg ${remote:GetFullName()}. Strat:${strategy} Tgt:${target or "all"} Time:${string.format("%.5f", duration)}`) end;
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Added msg to batch ${remote:GetFullName()}. Strat:${strategy} Tgt:${target or "all"} Time:${string.format("%.5f", duration)}`) end;
 		if isServer then targets[target or "all"] = true end -- Record target *after* successful write
 	end)
 
-	if not writeOk then warn(`[DynamicSender ERR] Write Message fail ${remote:GetFullName()}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1 end
-
+	if not writeOk then warn(`[DynamicSender ERR] Write Message fail ${remote:GetFullName()}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1; return end
+	
+	if cursor.Index > 0 then -- Only mark active if buffer actually has data
+		activeRemotes[remote] = true -- Ensure remote is processed by Heartbeat
+	end
+	
 	-- Check Flush Trigger
 	if DynamicSender.Config.MaxBatchSizeTrigger > 0 and cursor.Index > DynamicSender.Config.MaxBatchSizeTrigger then
-		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Size ${cursor.Index} / ${DynamicSender.Config.MaxBatchSizeTrigger} -> Flush Trigger for ${remote:GetFullName()}`) end
-		processFrameBatches(remote)
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Size ${cursor.Index}/${DynamicSender.Config.MaxBatchSizeTrigger} -> Flush Trigger`) end
+		processFrameBatches(remote) -- Pass remote to potentially flush just this one
 	end
 end
 
-
-function DynamicSender:SendToMany(remote: RemoteEvent, data: any, targets: { Player })
+-- Send the same data to multiple players. Uses batching by default unless options.batch = false
+function DynamicSender:SendToMany(remote: RemoteEvent, data: any, targets: { Player }, options: SendOptions)
 	if not isServer then warn("[DynamicSender SndM ERR] Server only.") return end
 	if not remote then warn("[DynamicSender SndM ERR] RE nil.") return end
 	if not targets or #targets == 0 then warn("[DynamicSender SndM ERR] Targets empty.") return end
+	options = options or {} 
+
+	-- == Direct Send Logic ==
+	if options.batchable == false then
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] SendToMany Immediate ${remote:GetFullName()} Tgts:{#targets}`) end
+		local successCount = 0
+		-- Analyze ONCE
+		local meta = analyzeMetadata(data)
+		local strategy: number; local payload: any; local structInfo: {StructFieldInfo}? = nil
+		-- Select Strategy ONCE
+		if meta.isStructArrayCandidate and meta.structInfo then strategy=STRATEGY_STRUCT_ARRAY; payload=data; structInfo=meta.structInfo;
+		else
+			strategy=STRATEGY_LZ4; local ok, lz = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
+			if not ok or typeof(lz)~="string" then warn(`SndM Imm LZ4 Fail:${lz}`); metrics.errors+=1; return end -- Fail all if compression fails
+			payload=lz::string;
+		end
+		-- Send to each target individually
+		for _, playerTarget in ipairs(targets) do
+			if playerTarget and playerTarget:IsA("Player") and playerTarget.Parent then
+				metrics.serializeCount+=1 -- Count each as a serialize op
+				local startTime = os.clock()
+				local messageBuffer, messageInstances = _serializeSingleMessage(strategy, playerTarget, payload, structInfo)
+				metrics.totalSerializeTime += (os.clock() - startTime)
+				if messageBuffer then
+					metrics.sendErrors+=1
+					remote:FireClient(playerTarget,messageBuffer, messageInstances)
+					metrics.sendErrors-=1; successCount+=1; 
+				else
+					metrics.errors+=1; -- Serialization failed
+				end
+			else warn(`[DynamicSender SndM Imm WARN] Invalid target: {playerTarget}`) end
+		end
+		if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Immediate send done. Sent to ${successCount}/${#targets}.`) end
+		return -- Exit function, batching bypassed
+	end
 
 	local successfullyQueued = 0
+	-- Analyze ONCE before looping if possible (avoids re-analyzing identical data)
+	local meta = analyzeMetadata(data)
+	local strategy: number; local payload: any; local structInfo: { StructFieldInfo }? = nil
+	local precomputedLz4Payload: string? = nil -- Precompute LZ4 if that's the strategy
 
+	if meta.isStructArrayCandidate and meta.structInfo then
+		strategy = STRATEGY_STRUCT_ARRAY; payload = data; structInfo = meta.structInfo;
+	else
+		strategy = STRATEGY_LZ4
+		local lz4Ok, lz4Comp = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
+		if not lz4Ok or typeof(lz4Comp) ~= "string" then
+			warn(`[DynamicSender SndM ERR] Pre-loop LZ4 Compress fail: ${lz4Comp}. Cannot queue messages.`); metrics.errors+=1; return
+		end
+		precomputedLz4Payload = lz4Comp :: string
+		payload = precomputedLz4Payload -- Use the pre-compressed payload
+	end
+
+	-- Now loop through targets and add to the appropriate batch buffer
 	for _, playerTarget in ipairs(targets) do
 		if playerTarget and playerTarget:IsA("Player") and playerTarget.Parent then
-			-- Get the shared batch cursor and target list for this remote event
-			-- This might be called multiple times if the size trigger flushes mid-loop
-			local cursor, batchTargets = getOrCreateBatchCursor(remote)
+			local cursor, batchTargets = getOrCreateBatchCursor(remote) -- Get shared batch buffer
 
-			local meta = analyzeMetadata(data) -- Analyze for each target (needed for strategy selection)
-
-			local strategy: number
-			local payload: any
-			local structInfo: { StructFieldInfo }? = nil
-
-			-- Select Strategy (Potentially done repeatedly if LZ4)
-			if meta.isStructArrayCandidate and meta.structInfo then
-				strategy = STRATEGY_STRUCT_ARRAY
-				payload = data
-				structInfo = meta.structInfo
-				-- metrics.structArrayPayloads incremented below after successful write
-				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG Target ${playerTarget.Name}] Strat: Struct[]`) end
-			else
-				strategy = STRATEGY_LZ4
-				-- LZ4 Compression happens per target if this path is taken
-				local lz4Ok, lz4Payload = pcall(LZ4_Lib.Compress, LZ4_Lib, data)
-				if not lz4Ok or typeof(lz4Payload) ~= "string" then
-					warn(`[DynamicSender SndM ERR Target ${playerTarget.Name}] LZ4 Compress fail: ${lz4Payload}. Msg cancelled for this target.`); metrics.errors+=1;
-					continue -- Skip this target
-				end
-				payload = lz4Payload :: string
-				-- metrics.lz4Payloads incremented below after successful write
-				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG Target ${playerTarget.Name}] Strat: LZ4`) end
-			end
-
-			-- Write message (Strategy + Specific Target + Payload) to batch cursor
+			-- Write message (Strategy + Specific Target + Pre-calculated Payload) to batch cursor
 			local writeOk, writeErr = pcall(function()
 				cursor:WriteU1(strategy) -- Strategy Marker
-				-- Write the SPECIFIC player target using the Instance handler
-				writeTargetInfoInternal(cursor, playerTarget)
+				writeTargetInfoInternal(cursor, playerTarget) -- Specific player target
 
 				local startTime = os.clock()
-				-- Payload Writing
-				if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string)
-				elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "SndM Batch sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo)
+				-- Payload Writing (Payload already prepared)
+				if strategy == STRATEGY_LZ4 then writeBinaryPayloadInternal(cursor, payload::string); metrics.lz4Payloads += 1;
+				elseif strategy == STRATEGY_STRUCT_ARRAY then assert(structInfo, "SndM Batch sInfo nil"); writeStructArrayInternal(cursor, payload::{any}, structInfo); metrics.structArrayPayloads += 1;
 				else error("SndM Batch Bad strat:"..strategy, 0) end
 				local duration = os.clock() - startTime
 
 				-- Update Metrics & Debug Log
 				metrics.serializeCount += 1; metrics.totalSerializeTime += duration
-				if strategy == STRATEGY_LZ4 then metrics.lz4Payloads += 1 else metrics.structArrayPayloads += 1 end -- Increment correct payload type
-
 				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Added msg to batch for ${playerTarget.Name} on ${remote:GetFullName()}. Strat:${strategy} Time:${string.format("%.5f", duration)}`) end;
 
 				-- Record target in the batch state *after* successful write
@@ -1266,71 +1359,65 @@ function DynamicSender:SendToMany(remote: RemoteEvent, data: any, targets: { Pla
 				successfullyQueued += 1
 			end)
 
-			if not writeOk then
-				warn(`[DynamicSender SndM ERR] Write Message fail for ${playerTarget.Name} on ${remote:GetFullName()}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1
-				-- Don't check flush trigger if write failed for this target
-				continue
+			if not writeOk then warn(`[DynamicSender SndM ERR] Write fail for ${playerTarget.Name}:${writeErr}`); metrics.errors+=1; metrics.sendErrors+=1; continue end
+			
+			if cursor.Index > 0 then -- Only mark active if buffer actually has data
+				activeRemotes[remote] = true -- Ensure remote is processed by Heartbeat
 			end
-
+			
 			-- Check Flush Trigger *after each successful write*
 			if DynamicSender.Config.MaxBatchSizeTrigger > 0 and cursor.Index > DynamicSender.Config.MaxBatchSizeTrigger then
-				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Size ${cursor.Index} / ${DynamicSender.Config.MaxBatchSizeTrigger} -> Flush Trigger during SendToMany`) end
-				processFrameBatches() -- Flush the shared buffer
+				if DynamicSender.Config.DebugMode then print(`[DynamicSender SndM DBG] Flush Trigger during SendToMany`) end
+				processFrameBatches(remote) -- Pass remote to flush this specific batch buffer
 			end
-
 		else
-			warn(`[DynamicSender SendToMany WARN] Invalid or disconnected target in list: {playerTarget}`)
+			warn(`[DynamicSender SendToMany WARN] Invalid or disconnected target: {playerTarget}`)
 		end
-	end -- End of the for loop over targets
+	end -- End of target loop
 
-	if DynamicSender.Config.DebugMode then
-		print(`[DynamicSender DBG] SendToMany (Batched): Finished queuing messages for {successfullyQueued}/{#targets} targets. Actual send deferred to batch processing.`)
-	end
-
+	if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] SendToMany Batch: Queued {successfullyQueued}/{#targets} msgs.`) end
 end
 
-function DynamicSender:DecodeReceivedData(rawDataBuffer: buffer, rawInstances: {Instance}?): {any}
-	if typeof(rawDataBuffer)~="buffer" then
-		if rawDataBuffer == nil then
-			return {}
-		end
-		warn("[DynamicSender ERR] Buffer expected")
-		metrics.decodeErrors+=1
-		return{}
-	end
-	
-	if rawInstances and typeof(rawInstances)~="table" then warn("[DynamicSender WARN] Instances !table");rawInstances={} end;
 
-	local decodedMessages={}; local startTime=os.clock(); local cursor=CursorModule(rawDataBuffer, rawInstances or {});
+function DynamicSender:DecodeReceivedData(rawDataBuffer: buffer, rawInstances: {Instance}?): {any}
+	if typeof(rawDataBuffer) ~= "buffer" then
+		if rawDataBuffer == nil then
+			if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] DecodeReceivedData received nil buffer (likely from nil direct send), returning empty table.") end
+			return {} -- Return empty if buffer is nil
+		end
+		warn("[DynamicSender ERR] Buffer expected for DecodeReceivedData"); metrics.decodeErrors+=1; return {}
+	end
+	if buffer.len(rawDataBuffer) == 0 then return {} end -- Empty buffer means no messages
+
+	if rawInstances and typeof(rawInstances)~="table" then warn("[DynamicSender WARN] Decode instances not table"); rawInstances={} end
+
+	local decodedMessages = {}; local startTime = os.clock(); local cursor = CursorModule(rawDataBuffer, rawInstances or {});
 
 	while cursor.Index < buffer.len(rawDataBuffer) do
 		local messageStartIndex = cursor.Index;
-		local success, messageData = pcall(function() -- Pcall per message
-			local strategy = cursor:ReadU1(); if not strategy then error("Read strat marker fail",0) end
-			local _targetInfo; if isClient then _targetInfo = readTargetInfoInternal(cursor) end -- Read Target info
+		local success, messageData = pcall(function()
+			local strategy = cursor:ReadU1(); if not strategy then error("Read strat fail",0) end
+			local _targetInfo; if isClient then _targetInfo = readTargetInfoInternal(cursor) end
 
-			local finalData: any; -- To hold final Luau value
-			if strategy == STRATEGY_LZ4 then -- Handle LZ4 path
-				local pTC=cursor:ReadU1(); if pTC ~= TYPE_CODES.Binary then error("Exp Bin TC")end;
-				local reader=TypesModule.Reads.Binary; if not reader then error("No Bin Reader")end;
-				local sPayload=reader(cursor); if typeof(sPayload)~="string" then error("Bin read !str")end;
-				local lzOk,lzResult = pcall(LZ4_Lib.Decompress,LZ4_Lib,sPayload);
-				if not lzOk then warn(`[DynamicSender ERR] LZ4 Dec:${lzResult}`); error("LZ4 Dec fail",0) end;
+			local finalData: any;
+			if strategy == STRATEGY_LZ4 then
+				local pTC=cursor:ReadU1(); if pTC ~= TYPE_CODES.Binary then error("Exp Bin TC") end;
+				local reader=TypesModule.Reads.Binary; if not reader then error("No Bin Reader") end;
+				local sPayload=reader(cursor); if typeof(sPayload)~="string" then error("Bin read !str") end;
+				local lzOk, lzResult = pcall(LZ4_Lib.Decompress, LZ4_Lib, sPayload);
+				if not lzOk then warn(`[DS ERR] LZ4 Dec:${lzResult}`); error("LZ4 Dec fail",0) end;
 				finalData=lzResult
-
-			elseif strategy == STRATEGY_STRUCT_ARRAY then -- Handle Struct Array path
+			elseif strategy == STRATEGY_STRUCT_ARRAY then
 				finalData = readStructArrayInternal(cursor)
-			else
-				error("Unknown message strategy marker: "..strategy, 0) -- Unknown strategy
-			end
+			else error("Unknown strategy marker: "..strategy, 0) end
 			return finalData
 		end)
 
-		if success then table.insert(decodedMessages,messageData); metrics.deserializeCount+=1
-		else warn(`[DynamicSender ERR] Dec fail @${messageStartIndex}: ${tostring(messageData)}`); metrics.errors+=1; metrics.decodeErrors+=1; warn("[DynamicSender ERR] Stop batch dec."); break -- Stop on decode error
+		if success then table.insert(decodedMessages, messageData); metrics.deserializeCount+=1
+		else warn(`[DS ERR] Dec fail @${messageStartIndex}: ${tostring(messageData)}`); metrics.errors+=1; metrics.decodeErrors+=1; warn("[DS ERR] Stop batch dec."); break
 		end
 	end
-	metrics.totalDeserializeTime+=(os.clock()-startTime); if DynamicSender.Config.DebugMode then print("[DynamicSender DBG] Decode done. Msgs:{#decodedMessages}")end; return decodedMessages
+	metrics.totalDeserializeTime+=(os.clock()-startTime); if DynamicSender.Config.DebugMode then print("[DS DBG] Decode done. Msgs:{#decodedMessages}")end; return decodedMessages
 end
 
 --==============================================================================
