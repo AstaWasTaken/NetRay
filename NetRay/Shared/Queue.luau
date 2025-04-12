@@ -101,7 +101,7 @@ end
 -- Add an item to the queue
 function Queue:Enqueue(item: T) -- Type T for item
 	self._stats.enqueues += 1
-
+--	print(os.time(), string.format("[Queue] Enqueued. Size: %d, Head: %d, Tail: %d, Cap: %d", self._size, self._head, self._tail, self._capacity))
 	if self._size >= self._capacity then
 		self:_Resize(mathCeil(self._capacity * GROWTH_FACTOR))
 	end
@@ -124,18 +124,57 @@ function Queue:_PhysicalIndex(logicalIndex: number): number
 end
 
 -- Resize internal array
+-- In Queue.lua
 function Queue:_Resize(newCapacity: number)
 	if newCapacity <= self._size then error("New capacity must be larger than current size", 2) end
 	self._stats.resizes += 1
-	local newItems = tableCreate(newCapacity) :: {[number]: T?} -- Assert type
-	if self._head <= self._tail then -- Contiguous block
-		for i = self._head, self._tail - 1 do newItems[i - self._head + 1] = self._items[i] end
-	else -- Wrapped around
-		local newIdx = 1
-		for i = self._head, self._capacity do newItems[newIdx] = self._items[i]; newIdx += 1 end
-		for i = 1, self._tail - 1 do newItems[newIdx] = self._items[i]; newIdx += 1 end
+	local newItems = tableCreate(newCapacity) :: {[number]: T?}
+
+--	print(os.time(), string.format("[Queue Resize Start] OldCap: %d, NewCap: %d, Size: %d, Head: %d, Tail: %d", self._capacity, newCapacity, self._size, self._head, self._tail)) -- Add log
+
+	-- Copy items into newItems starting at index 1
+	local currentTargetIndex = 1
+	if self._head < self._tail then -- Contiguous block (Normal Case)
+		-- Copy from old physical index self._head up to self._tail - 1
+		for i = self._head, self._tail - 1 do
+			newItems[currentTargetIndex] = self._items[i]
+			currentTargetIndex = currentTargetIndex + 1
+		end
+	else -- Wrapped around block
+		-- Copy from old physical index self._head up to self._capacity
+		for i = self._head, self._capacity do
+			newItems[currentTargetIndex] = self._items[i]
+			currentTargetIndex = currentTargetIndex + 1
+		end
+		-- Copy from old physical index 1 up to self._tail - 1
+		for i = 1, self._tail - 1 do
+			newItems[currentTargetIndex] = self._items[i]
+			currentTargetIndex = currentTargetIndex + 1
+		end
 	end
-	self._items = newItems; self._head = 1; self._tail = self._size + 1; self._capacity = newCapacity
+
+	-- Check if the number of copied items matches the size
+	local itemsCopied = currentTargetIndex - 1
+	if itemsCopied ~= self._size then
+		warn(string.format("[Queue Resize WARN] Size mismatch after copy! Expected %d, Copied %d. State(H:%d,T:%d,C:%d)", self._size, itemsCopied, self._head, self._tail, self._capacity))
+		-- This indicates a potential logic error in the copy loops above
+	end
+
+	-- Update internal state
+	self._items = newItems
+	self._head = 1                     -- New head is always 1
+	self._tail = self._size + 1       -- New tail is size + 1 (index after last item)
+	self._capacity = newCapacity
+
+	-- Log state AFTER resize 
+	--print(os.time(), string.format("[Queue Resize Complete] New Cap: %d, Size: %d, Head: %d, Tail: %d", self._capacity, self._size, self._head, self._tail))
+	local snippet = {}; local log = {"    New Items (Start): {"}; local first=true
+	for i = 1, math.min(5, self._size) do if not first then table.insert(log,", ") end; table.insert(log,string.format("[%d]=",i)); table.insert(log,tostring(self._items[i])); first=false; end
+	table.insert(log," }");-- print(table.concat(log))
+	-- Check if the item at the new head is nil IMMEDIATELY after resize
+	if self._size > 0 and self._items[self._head] == nil then
+		warn("[Queue Resize CRITICAL] Item at new head (index 1) is nil immediately after resize!")
+	end
 end
 
 -- Remove and return item from front
@@ -145,6 +184,17 @@ function Queue:Dequeue(): T? -- Returns optional T
 	self._stats.dequeues += 1
 
 	local physicalHead = self._head -- Store physical index before incrementing
+--	print("----> Queue State Before Dequeue <----")
+--	print("      Size:", self._size, "Head:", self._head, "Tail:", self._tail, "Cap:", self._capacity)
+	-- Log only a relevant snippet around head if table is huge
+	local snippet = {}
+	for i = math.max(1, self._head - 2), math.min(self._capacity, self._head + 2) do
+		snippet[i] = self._items[i]
+	end
+--	print("      Items near head:", snippet)
+	-- Or print the whole table if small enough for debugging:
+	-- print("      Full _items:", self._items)
+--	print("------------------------------------")
 	local item = self._items[physicalHead]
 	self._items[physicalHead] = nil -- Clear reference
 	self._head = (self._head % self._capacity) + 1
@@ -159,6 +209,8 @@ function Queue:Dequeue(): T? -- Returns optional T
 	local processingTime = tick() - startTime
 	self._stats.processingTimeTotal += processingTime
 	self._stats.processingCount += 1
+--	print(os.time(), string.format("[Queue] Dequeued. New Size: %d, New Head: %d, Tail: %d", self._size, self._head, self._tail))
+--	print("    Dequeued Item:", item)
 	return item -- Return the dequeued item
 end
 
@@ -202,6 +254,7 @@ end
 
 -- Remove item by predicate
 function Queue:Remove(predicate: (value: T) -> boolean): T? -- Predicate takes T, returns optional T
+	warn("removed")
 	local index = self:Find(predicate)
 	if not index then return nil end
 	local physicalIndex = self:_PhysicalIndex(index)

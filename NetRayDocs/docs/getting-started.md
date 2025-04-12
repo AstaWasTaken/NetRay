@@ -88,8 +88,7 @@ playerJoinEvent:OnEvent(function(data)
 end)
 
 -- Example: Sending data to the server
-local reportLatencyEvent = NetRay:RegisterEvent("ReportLatency", {batchable=false}) -- Don't batch latency reports
-
+local reportLatencyEvent = NetRay:GetEvent("ReportLatency") 
 task.delay(10, function()
     -- Ensure GetNetworkPing exists and is appropriate here
     local pingMethod = LocalPlayer.GetNetworkPing or LocalPlayer.GetPing
