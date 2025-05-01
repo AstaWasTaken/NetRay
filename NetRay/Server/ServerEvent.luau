@@ -280,7 +280,7 @@ function ServerEvent:FireAllClients(data: any)
 	end
 	
 	if not data then
-		self.RemoteEvent:FireClient(data)
+		self.RemoteEvent:FireAllClients(data)
 		return
 	end
 	
@@ -298,7 +298,7 @@ function ServerEvent:FireAllClients(data: any)
 	local allPlayers = Players:GetPlayers()
 	if #allPlayers == 0 then return end
 
-	DynamicSender:SendToMany(self.RemoteEvent, finalData, allPlayers)
+	DynamicSender:Send(self.RemoteEvent, finalData, nil)
 
 	-- 4. Fire Signal
 	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentAll", nil, finalData)
