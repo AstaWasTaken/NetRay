@@ -1,7 +1,7 @@
 --!optimize 2
 
 --[[
-    NetRay - High Performance Roblox Networking Library (v1.1.0)
+    NetRay - High Performance Roblox Networking Library (v1.1.5)
 
     Author: Asta (@TheYusufGamer)
     Created: 2025-03-22
@@ -94,7 +94,7 @@ NetRay.Priority = {
 	LOW = 3,
 	BACKGROUND = 4
 }
-NetRay.Version = "1.1.0"
+NetRay.Version = "1.1.5"
 
 NetRay.Debug = {
 	GlobalEvent = SignalPlusFactory(),

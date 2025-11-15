@@ -3,7 +3,7 @@
 
 -- BinaryEncoder.lua (Revised for LZ4 Compatibility, Cyclic References, Pack Formats, Recursion Fixes, and Integer Check)
 -- Author: Asta (@TheYusufGamer)
--- Version: v1.5.3 (Standardized pack formats)
+-- Version: v1.5.4 (Fixed instance handling)
 
 local BinaryEncoder = {}
 
@@ -58,6 +58,46 @@ local function isInteger(value: number): boolean return math_abs(value - math_fl
 local function writeLength(len: number): string if len < 255 then return CHAR_CACHE[len] else return CHAR_CACHE[255] .. string_pack(">I4", len) end end
 local function readLength(data: string, index: number): (number?, number?) local b=string_byte(data,index); if not b then return decodingError("readLen byte",index) end; index+=1; if b<255 then return b,index else if index+3>#data then return decodingError("readLen data",index) end; local l,ni=string_unpack(">I4",data,index); if not l then return decodingError("readLen unpack",index) end; return l,ni end end
 
+--[[ Helper: Get Instance Path ]]
+local function getInstancePath(instance: Instance): string?
+	if not instance then return nil end -- Handle nil input gracefully
+
+	local names = {}
+	local current: Instance? = instance
+	local gameService = game -- Cache the global
+
+	-- Walk up the hierarchy until 'game' or nil is reached
+	while current and current ~= gameService do
+		-- Check for invalid characters in names if necessary, though usually not an issue
+		-- if string.find(current.Name, ".", 1, true) then
+		--     warn("[BE Enc] Instance name contains '.' which might break pathfinding:", current:GetFullName())
+		-- end
+		table_insert(names, 1, current.Name) -- Prepend name
+		current = current.Parent
+	end
+
+	-- If the loop stopped because we hit 'game', the path is valid relative to game
+	if current == gameService then
+		return table_concat(names, ".")
+	else
+		-- Instance is not a descendant of game (e.g., parented to nil, CoreGui, etc.)
+		-- These often cannot or should not be reliably serialized by path.
+		warn(("[BE Enc] Instance %q is not a descendant of game, cannot create serializable path."):format(tostring(instance)))
+		return nil
+	end
+end
+
+--[[ Helper: Get Instance At Path ]]
+function GetInstanceAtPath(path)
+	local current = game
+	for segment in string.gmatch(path, "[^%.]+") do
+		current = current:FindFirstChild(segment)
+		if not current then
+			return nil
+		end
+	end
+	return current
+end
 
 --[[--- Internal Encoding Logic ---]]
 local function encodeValue(value: any, refs_encoding: {}, buffer: {string}, currentDepth: number)
@@ -123,7 +163,21 @@ local function encodeValue(value: any, refs_encoding: {}, buffer: {string}, curr
 	elseif valueType == "Rect" then table_insert(buffer,CHAR_CACHE[TYPE.RECT]); table_insert(buffer, string_pack("<dddd", value.Min.X, value.Min.Y, value.Max.X, value.Max.Y))       -- FIX: <dddd
 	elseif valueType == "CFrame" then table_insert(buffer,CHAR_CACHE[TYPE.CFRAME]); table_insert(buffer, string_pack("<dddddddddddd", value:GetComponents())) -- FIX: <d * 12
 	elseif valueType == "EnumItem" then table_insert(buffer,CHAR_CACHE[TYPE.ENUM]); encodeValue(tostring(value.EnumType), refs_encoding, buffer, currentDepth+1); encodeValue(tostring(value.Name), refs_encoding, buffer, currentDepth+1)
-	elseif valueType == "Instance" then local s,p=pcall(value.GetFullName, value); if s and p then table_insert(buffer,CHAR_CACHE[TYPE.INSTANCE_REF]); encodeValue(p, refs_encoding, buffer, currentDepth+1) else warn("[BE Enc] Inst path fail:",value); table_insert(buffer,CHAR_CACHE[TYPE.NIL]) end
+	elseif valueType == "Instance" then
+		-- Use the robust path function (Unchanged)
+		local path = getInstancePath(value)
+		if path then
+			if path == "" then
+				warn("[BE Enc] Instance path resulted in empty string for:", value)
+				table_insert(buffer, CHAR_CACHE[TYPE.NIL])
+			else
+				table_insert(buffer, CHAR_CACHE[TYPE.INSTANCE_REF])
+				encodeValue(path, refs_encoding, buffer, currentDepth + 1)
+			end
+		else
+			-- getInstancePath already warned if it couldn't generate a path
+			table_insert(buffer, CHAR_CACHE[TYPE.NIL]) -- Encode as nil if path generation failed
+		end
 	elseif valueType == "DateTime" then table_insert(buffer,CHAR_CACHE[TYPE.DATETIME]); table_insert(buffer, string_pack("<q", value.UnixTimestampMillis))
 	elseif valueType == "BrickColor" then table_insert(buffer,CHAR_CACHE[TYPE.BRICKCOLOR]); encodeValue(value.Number, refs_encoding, buffer, currentDepth+1)
 	elseif valueType == "NumberSequence" then table_insert(buffer,CHAR_CACHE[TYPE.NUMBERSEQUENCE]); local kp=value.Keypoints; encodeValue(#kp, refs_encoding, buffer, currentDepth+1); for _,k in ipairs(kp) do table_insert(buffer, string_pack("<ddd", k.Time, k.Value, k.Envelope)) end -- Kept <ddd
@@ -171,7 +225,26 @@ local function decodeValue(data: string, indexRef: {number}, refs_decoding: {}, 
 	elseif typeId == TYPE.RECT then if indexRef[1]+31>#data then return decodingError("EOF RECT",indexRef[1]) end; local nx,ny,xx,xy,idx=string_unpack("<dddd",data,indexRef[1]); if not idx then return decodingError("Unpk RECT",indexRef[1]) end; indexRef[1]=idx; return Rect_new(Vector2_new(nx,ny),Vector2_new(xx,xy)) -- FIX: <dddd
 	elseif typeId == TYPE.CFRAME then if indexRef[1]+95>#data then return decodingError("EOF CFRAME",indexRef[1]) end; local c={string_unpack("<dddddddddddd",data,indexRef[1])}; local idx=table.remove(c); if not idx then return decodingError("Unpk CFRAME",indexRef[1]) end; indexRef[1]=idx; return CFrame_new(table.unpack(c,1,12)) -- FIX: <d * 12
 	elseif typeId == TYPE.ENUM then local etn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); local evn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(etn)~="string" or type(evn)~="string" then return decodingError("Enum str",indexRef[1]) end; local ok,ei=pcall(function()return Enum_Type[etn][evn]end); if ok and ei then return ei else warn("[BE Dec] Enum fail:",etn,evn); return nil end
-	elseif typeId == TYPE.INSTANCE_REF then local pth=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(pth)~="string" then return decodingError("Inst path str",indexRef[1]) end; local ok,ins=pcall(game.FindFirstChild, game, pth, true); if ok and ins then return ins else warn("[BE Dec] Inst fail:",pth); return nil end
+	elseif typeId == TYPE.INSTANCE_REF then
+		local path = decodeValue(data, indexRef, refs_decoding, currentDepth + 1)
+		if type(path) ~= "string" then
+			return decodingError("Instance reference path must be a string, got " .. type(path), indexRef[1])
+		end
+		if path == "" then
+			warn("[BE Dec] Decoded empty instance path.")
+			return nil -- Treat empty path as nil
+		end
+		
+		local instance = GetInstanceAtPath(path)
+
+		if instance then
+			-- Found the instance successfully
+			return instance
+		else
+			-- Instance not found (FindFirstChild returned nil)
+			warn(("[BE Dec] Instance not found via path %q. (Possible reasons: Not replicated yet, FilteringEnabled issue, destroyed, invalid path)."):format(path))
+			return nil -- Return nil as the instance couldn't be resolved
+		end
 	elseif typeId == TYPE.DATETIME then if indexRef[1]+7>#data then return decodingError("EOF DT",indexRef[1]) end; local ms,idx=string_unpack("<q",data,indexRef[1]); if not idx then return decodingError("Unpk DT",indexRef[1]) end; indexRef[1]=idx; local ok,dt=pcall(DateTime_FromMillis,ms); if ok then return dt else warn("[BE Dec] DT fail:",ms); return nil end
 	elseif typeId == TYPE.BRICKCOLOR then local num=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(num)~="number" then return decodingError("BC num",indexRef[1]) end; local ok,bc=pcall(BrickColor_new,num); if ok then return bc else warn("[BE Dec] BC fail:",num); return nil end
 	elseif typeId == TYPE.NUMBERSEQUENCE then local nk=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(nk)~="number" or nk<0 or nk>20 then warn("[BE Dec] NS cnt clamp:",nk); nk=math.max(0,math.min(20,nk)) elseif nk~=math.floor(nk) then return decodingError("NS cnt int",indexRef[1]) end; local kps={}; local idx=indexRef[1]; local bn=nk*24; if idx+bn>#data+1 then return decodingError(("NS EOF %d need %d"):format(nk,bn),idx) end

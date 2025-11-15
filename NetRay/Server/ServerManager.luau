@@ -325,7 +325,7 @@ function ServerManagerImpl:ProcessMessage(message: QueuedMessage?)
 	end
 end
 
-function ServerManagerImpl:CreateRemoteEvent(eventName: string): RemoteEvent
+function ServerManagerImpl:CreateRemoteEvent(eventName: string, options: ServerEventOptions?): RemoteEvent
 	assert(self.RemoteFolder, "RemoteFolder not initialized")
 	local existingRemote = self.RemoteFolder:FindFirstChild(eventName)
 	if existingRemote and existingRemote:IsA("RemoteEvent") then
@@ -335,7 +335,12 @@ function ServerManagerImpl:CreateRemoteEvent(eventName: string): RemoteEvent
 		existingRemote:Destroy()
 	end
 
-	local remoteEvent = Instance.new("RemoteEvent")
+	local remoteEvent 
+	if options.UnreliableRemoteEvent == true then
+		remoteEvent = Instance.new("UnreliableRemoteEvent")
+	else
+		remoteEvent = Instance.new("RemoteEvent")
+	end
 	remoteEvent.Name = eventName
 	remoteEvent.Parent = self.RemoteFolder
 	return remoteEvent
@@ -366,7 +371,7 @@ function ServerManagerImpl:RegisterEvent(eventName: string, options: ServerEvent
 		return self.Events[eventName]
 	end
 
-	local remoteEvent = self:CreateRemoteEvent(eventName)
+	local remoteEvent = self:CreateRemoteEvent(eventName, options)
 	local eventInfo: ServerRegisteredEventInfo = {
 		Remote = remoteEvent,
 		Options = options,

@@ -200,13 +200,18 @@ end
 function ClientManagerImpl:StartQueueProcessing()
 	task.spawn(function()
 		while true do
+
 			local cycleStartTime = tick()
 			local processedAny = false
+		--	print(os.time(), "[Queue] Cycle Start") -- Optional: Keep if needed
 
 			-- Process Critical (all)
 			local criticalQueue = self.MessageQueues[0]
 			while not criticalQueue:IsEmpty() do
 				local message = criticalQueue:Dequeue()
+				-- Safer Debug Print
+			--	print(os.time(), string.format("[Mgr Proc] Cycle Critical. Dequeued item:"))
+			--	print("  ---> Message Content:", message)
 				self:ProcessMessage(message)
 				processedAny = true
 			end
@@ -218,6 +223,11 @@ function ClientManagerImpl:StartQueueProcessing()
 				local currentQueue = self.MessageQueues[priority]
 				while not currentQueue:IsEmpty() and processedCount < limit do
 					local message = currentQueue:Dequeue()
+
+					-- Corrected / Safer Debug Print:
+				--	print(os.time(), string.format("[Mgr Proc] Cycle - Prio %d, ProcCount %d, Limit %d. Dequeued item:", priority, processedCount, limit))
+				--	print("  ---> Message Content:", message) -- Print the table directly
+
 					self:ProcessMessage(message)
 					processedCount += 1
 					processedAny = true
@@ -237,14 +247,21 @@ function ClientManagerImpl:StartQueueProcessing()
 					local currentQueue = self.MessageQueues[priority]
 					while not currentQueue:IsEmpty() and processedCount < processTarget do
 						local message = currentQueue:Dequeue()
+
+						-- Corrected / Safer Debug Print:
+				--		print(os.time(), string.format("[Mgr Proc] Cycle Low/BG - Prio %d, ProcCount %d, Limit %d. Dequeued item:", priority, processedCount, limit))
+				--		print("  ---> Message Content:", message) -- Print the table directly
+
 						self:ProcessMessage(message)
 						processedCount += 1
 					end
 				end
 			end
 
+	--		 print(os.time(), "[Queue] Cycle End") -- Optional: Keep if needed
 			task.wait(CYCLE_WAIT)
 		end
+		 warn("[Queue] Processing Loop EXITED!") -- Should not happen
 	end)
 end
 
@@ -278,7 +295,7 @@ function ClientManagerImpl:GetRemoteEvent(eventName: string): RemoteEvent?
 
 	-- Use FindFirstChild first for efficiency if it already exists
 	local remoteEvent = self.RemoteFolder:FindFirstChild(eventName)
-	if remoteEvent and remoteEvent:IsA("RemoteEvent") then
+	if remoteEvent and remoteEvent:IsA("RemoteEvent") or remoteEvent:IsA("UnreliableRemoteEvent") then
 		return remoteEvent
 	elseif remoteEvent then
 		warn(("[NetRay ClientManager] Instance '%s' exists but is not a RemoteEvent."):format(eventName))
@@ -290,7 +307,7 @@ function ClientManagerImpl:GetRemoteEvent(eventName: string): RemoteEvent?
 		return self.RemoteFolder:WaitForChild(eventName, 5) -- Reduced wait time
 	end)
 
-	if success and foundEvent and foundEvent:IsA("RemoteEvent") then
+	if success and foundEvent and foundEvent:IsA("RemoteEvent") or foundEvent:IsA("UnreliableRemoteEvent") then
 		return foundEvent
 	elseif success and foundEvent then
 		warn(("[NetRay ClientManager] Found '%s' but it is not a RemoteEvent (Type: %s)."):format(eventName, foundEvent.ClassName))

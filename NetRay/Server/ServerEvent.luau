@@ -67,8 +67,8 @@ function ServerEvent.new(eventName: string, options: ServerEventOptions?, server
 
 	-- Register with the server manager and get event info
 	local eventData = serverManager:RegisterEvent(eventName, self.Options)
-	self.RemoteEvent = eventData.Remote :: RemoteEvent
-
+	self.RemoteEvent = eventData.Remote :: RemoteEvent 
+	
 	-- Initialize the Handlers array in the ServerManager's storage if it doesn't exist
 	if not eventData.Handlers then
 		eventData.Handlers = {} :: {ServerEventHandler}
@@ -84,7 +84,7 @@ function ServerEvent.new(eventName: string, options: ServerEventOptions?, server
 	self.Priority = options.priority or Constants.PRIORITY.NORMAL or 2 -- Default to NORMAL
 
 	-- Store batching preference (internal detail)
-	self.Batchable = options.batchable ~= false -- Default to true
+	self.Batchable = options.batchable or false -- Default to false
 
 	-- Set up listeners *after* all properties are initialized
 	self:SetupListeners()
@@ -253,13 +253,10 @@ function ServerEvent:FireClient(player: Player, data: any)
 	local finalData = if processedData ~= nil then processedData else data
 
 	-- 3. Send using DynamicSender
-	local dsOptions--  : DynamicSenderOptions?
-	if self.Batchable or self.Options.forceComparison then
-		dsOptions = {
-			batchable = self.Batchable,
-			forceComparison = self.Options.forceComparison
-		}
-	end
+	local dsOptions = {
+		batchable = self.Batchable,
+		forceComparison = self.Options.forceComparison
+	}
 
 	DynamicSender:Send(self.RemoteEvent, finalData, player, dsOptions)
 
@@ -280,7 +277,7 @@ function ServerEvent:FireAllClients(data: any)
 	end
 	
 	if not data then
-		self.RemoteEvent:FireClient(data)
+		self.RemoteEvent:FireAllClients(data)
 		return
 	end
 	
@@ -297,8 +294,14 @@ function ServerEvent:FireAllClients(data: any)
 	-- 3. Send using DynamicSender
 	local allPlayers = Players:GetPlayers()
 	if #allPlayers == 0 then return end
+	
+	local dsOptions = {
+		batchable = self.Batchable,
+		forceComparison = self.Options.forceComparison
+	}
 
-	DynamicSender:SendToMany(self.RemoteEvent, finalData, allPlayers)
+	
+	DynamicSender:Send(self.RemoteEvent, finalData, nil,dsOptions)
 
 	-- 4. Fire Signal
 	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentAll", nil, finalData)
@@ -353,9 +356,13 @@ function ServerEvent:FireAllClientsExcept(excludedPlayer: Player, data: any)
 	
 	-- 4. Send using DynamicSender
 	DynamicSender:SendToMany(self.RemoteEvent, finalData, playersToSend)
+	local dsOptions = {
+		batchable = self.Batchable,
+		forceComparison = self.Options.forceComparison
+	}
 
 	-- 5. Fire Signal
-	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentExcept", excludedPlayer, finalData)
+	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentExcept", excludedPlayer, finalData, dsOptions)
 
 	if self.ServerManager.DebugEnabled then
 		print(("[NetRay ServerEvent] Event '%s' fired to %d clients (excluding %s)"):format(
@@ -416,8 +423,13 @@ function ServerEvent:FireFilteredClients(filter: (player: Player) -> boolean, da
 	end
 	local finalData = if processedData ~= nil then processedData else data
 	
+	local dsOptions = {
+		batchable = self.Batchable,
+		forceComparison = self.Options.forceComparison
+	}
+	
 	-- 4. Send using DynamicSender
-	DynamicSender:SendToMany(self.RemoteEvent, finalData, playersToSend)
+	DynamicSender:SendToMany(self.RemoteEvent, finalData, playersToSend,dsOptions)
 
 	-- 5. Fire Signal
 	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentFiltered", nil, finalData)

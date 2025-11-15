@@ -347,26 +347,25 @@ function TypeChecker.isValidEventPayload(data: any): boolean
 end
 
 -- Public Validate function (wrapper for validateData with standard result format)
-function TypeChecker.Validate(data: any, typeDefinition: {[string]: string}): TypeCheckerResult
+function TypeChecker:Validate(data: any, typeDefinition: {[string]: string}): TypeCheckerResult
 	-- Use pcall to catch potential errors *within* validateData or isType (e.g., bad type strings)
-	local success, result = pcall(TypeChecker.validateData, data, typeDefinition)
+	local pcallSuccess, isValid, errorMsg = pcall(TypeChecker.validateData, data, typeDefinition)
 
-	if not success then
+	if not pcallSuccess then
 		-- Error occurred during validation itself
+		-- When pcall fails, isValid contains the error message
 		return {
 			success = false,
-			error = "Type validation internal error: " .. tostring(result)
+			error = "Type validation internal error: " .. tostring(isValid)
 		}
 	else
-		-- validateData returns {isValid, errorMsg}
-		local isValid, errorMsg = table.unpack(result) -- Use table.unpack if validateData returns a table now
+		-- validateData returns (boolean, string?)
 		return {
 			success = isValid,
 			error = errorMsg -- Will be nil if isValid is true
 		}
 	end
 end
-
 
 -- Check if a table matches a simple key-value structure (not type-aware, just presence and basic typeof)
 function TypeChecker.matchesSchema(data: any, schema: {[string]: any}): boolean

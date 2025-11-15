@@ -166,7 +166,7 @@ function Queue:_Resize(newCapacity: number)
 	self._tail = self._size + 1       -- New tail is size + 1 (index after last item)
 	self._capacity = newCapacity
 
-	-- Log state AFTER resize 
+	-- Log state AFTER resize (Using corrected print from last time)
 	--print(os.time(), string.format("[Queue Resize Complete] New Cap: %d, Size: %d, Head: %d, Tail: %d", self._capacity, self._size, self._head, self._tail))
 	local snippet = {}; local log = {"    New Items (Start): {"}; local first=true
 	for i = 1, math.min(5, self._size) do if not first then table.insert(log,", ") end; table.insert(log,string.format("[%d]=",i)); table.insert(log,tostring(self._items[i])); first=false; end
@@ -254,7 +254,6 @@ end
 
 -- Remove item by predicate
 function Queue:Remove(predicate: (value: T) -> boolean): T? -- Predicate takes T, returns optional T
-	warn("removed")
 	local index = self:Find(predicate)
 	if not index then return nil end
 	local physicalIndex = self:_PhysicalIndex(index)

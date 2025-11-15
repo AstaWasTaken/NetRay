@@ -87,10 +87,10 @@ end
 
 -- Internal method to set up RemoteEvent listener
 function ClientEvent:SetupListeners()
-	self.RemoteEvent.OnClientEvent:Connect(function(encodedData: any)
+	self.RemoteEvent.OnClientEvent:Connect(function(encodedData: any, instances)
 		-- 1. Decode incoming data
 		local decodeSuccess, decodedData = pcall(function()
-			return DynamicSender:DecodeReceivedData(encodedData)
+			return DynamicSender:DecodeReceivedData(encodedData,instances)
 		end)
 
 		if not decodeSuccess then
@@ -100,7 +100,7 @@ function ClientEvent:SetupListeners()
 			return
 		end
 		-- decodedData now holds the actual payload (or array of payloads)
-
+		
 		-- Get event info from manager (should exist)
 		local eventInfo = self.ClientManager.Events[self.Name]
 		if not eventInfo or not eventInfo.Handlers then
@@ -108,7 +108,6 @@ function ClientEvent:SetupListeners()
 			return -- Should not happen if .new succeeded
 		end
 		local handlers = eventInfo.Handlers :: {ClientEventHandler} -- Assert type
-
 
 		-- Function to process a single event payload (handles validation, middleware, CB, enqueueing)
 		local function processSingleEvent(data: any): boolean
@@ -146,7 +145,7 @@ function ClientEvent:SetupListeners()
 				-- Don't queue the message if CB is open
 				return false -- Indicate failure to queue/process
 			end
-
+			local finalData = data
 			-- 5. Enqueue Handler Execution
 			if #handlers == 0 then
 				if self.ClientManager.DebugEnabled then
@@ -179,7 +178,6 @@ function ClientEvent:SetupListeners()
 			-- The actual handler success/failure updates the CB later.
 			return true -- Indicate successful enqueueing/processing step
 		end -- End of processSingleEvent
-
 
 		-- Check if decoded data is likely a batch (array of tables/values)
 		-- Relying on DynamicSender's potential batching mechanism.
@@ -280,7 +278,8 @@ function ClientEvent:FireServer(data: any)
 		-- 5. Send using DynamicSender
 		-- DynamicSender handles serialization, compression (if configured), batching.
 		-- It doesn't typically throw errors for network issues itself, but might for bad input
-		DynamicSender:Send(self.RemoteEvent, finalData, nil)
+		
+		DynamicSender:Send(self.RemoteEvent, finalData,nil ,{batchable = false})
 
 		-- If we reach here, the send call itself didn't error immediately.
 		sendSuccess = true -- Mark send attempt as successful *within pcall*
