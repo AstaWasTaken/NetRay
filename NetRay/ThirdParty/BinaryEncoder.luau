@@ -227,6 +227,7 @@ local function decodeValue(data: string, indexRef: {number}, refs_decoding: {}, 
 	elseif typeId == TYPE.ENUM then local etn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); local evn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(etn)~="string" or type(evn)~="string" then return decodingError("Enum str",indexRef[1]) end; local ok,ei=pcall(function()return Enum_Type[etn][evn]end); if ok and ei then return ei else warn("[BE Dec] Enum fail:",etn,evn); return nil end
 	elseif typeId == TYPE.INSTANCE_REF then
 		local path = decodeValue(data, indexRef, refs_decoding, currentDepth + 1)
+		print(path)
 		if type(path) ~= "string" then
 			return decodingError("Instance reference path must be a string, got " .. type(path), indexRef[1])
 		end
@@ -235,6 +236,7 @@ local function decodeValue(data: string, indexRef: {number}, refs_decoding: {}, 
 			return nil -- Treat empty path as nil
 		end
 		
+		print(GetInstanceAtPath(path))
 		local instance = GetInstanceAtPath(path)
 
 		if instance then

@@ -91,7 +91,7 @@ local Constants: ConstantsModule = {
 	REMOTE_NAMING = {
 		FUNCTION_SUFFIX = "_RF", EVENTS_FOLDER = "NetRayRemotes"
 	},
-	VERSION = "1.1.5"
+	VERSION = "1.1.2"
 }
 
 return Constants

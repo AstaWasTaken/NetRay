@@ -3,7 +3,7 @@
 --!native
 
 --[[
-    DynamicSender Module (v1.3.0 - Refactored Batching & Type Safety)
+    DynamicSender Module (v1.2.9 - Refactored Batching)
 
     Implements dynamic strategy selection (LZ4 or Struct Array) for serialization.
     Handles frame-based batching for network efficiency using per-target queues.
@@ -74,8 +74,8 @@ type SendOptions = {
 export type DynamicSenderModule = {
 	VERSION: string,
 	Config: DynamicSenderConfig,
-	Send: (self: DynamicSenderModule, remote: AnyRemoteEvent, data: any, target: Player?, options: SendOptions?) -> (),
-	SendToMany: (self: DynamicSenderModule, remote: AnyRemoteEvent, data: any, targets: { Player }, options: SendOptions?) -> (),
+	Send: (self: DynamicSenderModule, remote: RemoteEvent, data: any, target: Player?, options: SendOptions?) -> (),
+	SendToMany: (self: DynamicSenderModule, remote: RemoteEvent, data: any, targets: { Player }, options: SendOptions?) -> (),
 	DecodeReceivedData: (self: DynamicSenderModule, rawDataBuffer: buffer, rawInstances: {Instance}?) -> {any},
 	GetMetrics: (self: DynamicSenderModule) -> DynamicSenderMetrics,
 	ResetMetrics: (self: DynamicSenderModule) -> (),
@@ -90,7 +90,7 @@ local BYTE_TO_TYPE_NAME: { [TypeCode]: TypeName } = {}
 local TYPE_CODES: { [TypeName]: TypeCode } = {}
 
 local DynamicSender = {}
-DynamicSender.VERSION = "1.3.0"
+DynamicSender.VERSION = "1.2.9"
 
 --==============================================================================
 -- Constants
@@ -120,8 +120,8 @@ local isClient = RunService:IsClient()
 local isServer = RunService:IsServer()
 
 -- Refactored Batch State: Holds per-player cursors and a shared 'all' cursor per remote
-local batchState: { [AnyRemoteEvent]: { PerPlayerCursors: { [Player]: Cursor }, AllCursor: Cursor? } } = {}
-local activeRemotes: { [AnyRemoteEvent]: boolean } = {} -- Tracks remotes with pending data in *any* cursor
+local batchState: { [RemoteEvent]: { PerPlayerCursors: { [Player]: Cursor }, AllCursor: Cursor? } } = {}
+local activeRemotes: { [RemoteEvent]: boolean } = {} -- Tracks remotes with pending data in *any* cursor
 local runServiceConnection: RBXScriptConnection | nil = nil
 
 -- Performance Metrics
@@ -138,8 +138,8 @@ local metrics = {
 local writeStructArrayInternal: (cursor: Cursor, data: { { [string]: any } }, structInfo: { StructFieldInfo }) -> ()
 local readStructArrayInternal: (cursor: Cursor) -> { { [string]: any } }
 local analyzeMetadata: (data: any) -> ({ [string]: any })
-local processFrameBatches: (triggeredRemote: AnyRemoteEvent?) -> ()
-local getOrCreateBatchCursor: (remote: AnyRemoteEvent, target: Player?) -> Cursor
+local processFrameBatches: (triggeredRemote: RemoteEvent?) -> ()
+local getOrCreateBatchCursor: (remote: RemoteEvent, target: Player?) -> Cursor
 local writeBinaryPayloadInternal: (cursor: Cursor, payload: string) -> ()
 local getBestNumberType: (minVal: number, maxVal: number, isFloat: boolean) -> (TypeName, TypeCode)
 local isStructArrayCandidate : (data: any, depth: number, config: typeof(DynamicSender.Config)) -> ({ StructFieldInfo }?, number)
@@ -971,7 +971,7 @@ end
 -- Gets or creates the appropriate cursor for batching.
 -- If target is nil, uses the shared 'AllCursor'.
 -- If target is a Player, uses/creates a cursor specific to that player.
-getOrCreateBatchCursor = function(remote: AnyRemoteEvent, target: Player?): Cursor
+getOrCreateBatchCursor = function(remote: RemoteEvent, target: Player?): Cursor
 	local remoteState = batchState[remote]
 	if not remoteState then
 		if DynamicSender.Config.DebugMode then print(`[DynamicSender DBG] Create batch state for ${remote.Name}`) end
@@ -1000,8 +1000,8 @@ getOrCreateBatchCursor = function(remote: AnyRemoteEvent, target: Player?): Curs
 end
 
 -- Main batch processing function (Refactored)
-processFrameBatches = function(triggeredRemote: AnyRemoteEvent?)
-	local remotesToActuallyProcess: {[AnyRemoteEvent]: boolean} = {}
+processFrameBatches = function(triggeredRemote: RemoteEvent?)
+	local remotesToActuallyProcess: {[RemoteEvent]: boolean} = {}
 	-- If called by a trigger, add that specific remote
 	if triggeredRemote and batchState[triggeredRemote] then
 		remotesToActuallyProcess[triggeredRemote] = true
@@ -1031,11 +1031,10 @@ processFrameBatches = function(triggeredRemote: AnyRemoteEvent?)
 		print(`[DynamicSender DBG] processFrameBatches - Processing ${count} remote(s)`)
 	end
 
-	local playersToRemoveFromRemote: {[AnyRemoteEvent]: {Player}} = {} -- Track disconnected players for cleanup
+	local playersToRemoveFromRemote: {[RemoteEvent]: {Player}} = {} -- Track disconnected players for cleanup
 
 	for remote, _ in pairs(remotesToActuallyProcess) do
-		-- ▼▼▼ FIX: Corrected the logical check for the remote type ▼▼▼
-		if not remote or not (remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent")) then
+		if not remote or typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then
 			warn("[DynamicSender WARN] Invalid remote key found in processing list. Skipping.")
 			continue
 		end
@@ -1131,12 +1130,12 @@ end
 -- Public API
 --==============================================================================
 
-function DynamicSender:Send(remote: AnyRemoteEvent, data: any, target: Player?, options)
+function DynamicSender:Send(remote: RemoteEvent, data: any, target: Player?, options: SendOptions?)
 	if not remote then warn("[DynamicSender ERR] RemoteEvent is nil.") return end
 	if isClient and target then warn("[DynamicSender WARN] Target parameter ignored from client.") target = nil end
 	if isServer and target and not target:IsA("Player") then warn("[DynamicSender ERR] Target must be Player instance or nil.") return end
 	options = options or {}
-	local batchable = options.batchable or false -- Default to false if nil or not specified
+	local batchable = options.batchable ~= false -- Default to true if nil or not specified
 
 	-- == Direct Send Logic ==
 	if not batchable then
@@ -1225,12 +1224,12 @@ function DynamicSender:Send(remote: AnyRemoteEvent, data: any, target: Player?, 
 	end
 end
 
-function DynamicSender:SendToMany(remote: AnyRemoteEvent, data: any, targets: { Player }, options: SendOptions?)
+function DynamicSender:SendToMany(remote: RemoteEvent, data: any, targets: { Player }, options: SendOptions?)
 	if not isServer then warn("[DynamicSender SndM ERR] Server only.") return end
 	if not remote then warn("[DynamicSender SndM ERR] RE nil.") return end
 	if not targets or #targets == 0 then warn("[DynamicSender SndM ERR] Targets empty.") return end
 	options = options or {}
-	local batchable = options.batchable or false -- Default to false
+	local batchable = options.batchable ~= false -- Default to true
 
 	-- == Direct Send Logic ==
 	if not batchable then

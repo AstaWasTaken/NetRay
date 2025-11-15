@@ -300,8 +300,7 @@ function ServerEvent:FireAllClients(data: any)
 		forceComparison = self.Options.forceComparison
 	}
 
-	
-	DynamicSender:Send(self.RemoteEvent, finalData, nil,dsOptions)
+	DynamicSender:Send(self.RemoteEvent, finalData, nil)
 
 	-- 4. Fire Signal
 	self.ServerManager.Signals.EventFired:Fire(self.Name .. "_SentAll", nil, finalData)

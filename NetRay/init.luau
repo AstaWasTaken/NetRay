@@ -1,7 +1,7 @@
 --!optimize 2
 
 --[[
-    NetRay - High Performance Roblox Networking Library (v1.1.5)
+    NetRay - High Performance Roblox Networking Library (v1.1.2)
 
     Author: Asta (@TheYusufGamer)
     Created: 2025-03-22
