@@ -145,7 +145,6 @@ function ClientEvent:SetupListeners()
 				-- Don't queue the message if CB is open
 				return false -- Indicate failure to queue/process
 			end
-			local finalData = data
 			-- 5. Enqueue Handler Execution
 			if #handlers == 0 then
 				if self.ClientManager.DebugEnabled then
@@ -257,11 +256,6 @@ function ClientEvent:FireServer(data: any)
 				error(Errors.new("Validation", ("Outgoing type validation failed for event '%s': %s"):format(
 					self.Name, typeCheckResult.error or "Unknown error"), { eventName = self.Name }))
 			end
-		end
-		
-		if not data then
-			self.RemoteEvent:FireServer()
-			return
 		end
 		
 		-- 4. Middleware (Outgoing)

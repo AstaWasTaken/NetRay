@@ -222,10 +222,6 @@ end
 
 -- Method to fire the event to a specific client
 function ServerEvent:FireClient(player: Player, data: any)
-	if not data then
-		self.RemoteEvent:FireClient(player)
-	end
-	
 	if not player or not player:IsA("Player") or not player:IsDescendantOf(Players) then
 		error(("[NetRay ServerEvent] FireClient for '%s' expects a valid Player argument, got %s"):format(self.Name, typeof(player)), 2)
 		-- Return immediately after error
@@ -274,11 +270,6 @@ function ServerEvent:FireAllClients(data: any)
 				self.Name, typeCheckResult.error or "Unknown error"), 2)
 			return
 		end
-	end
-	
-	if not data then
-		self.RemoteEvent:FireAllClients(data)
-		return
 	end
 	
 	-- 2. Middleware (Outgoing)
@@ -337,12 +328,6 @@ function ServerEvent:FireAllClientsExcept(excludedPlayer: Player, data: any)
 	end
 	if #playersToSend == 0 then return end
 	
-	if not data then
-		for _, plr in playersToSend do
-			self.RemoteEvent:FireClient(plr)
-		end
-	end
-
 	-- 3. Middleware (Outgoing)
 	local continueProcessing, processedData = self.ServerManager:InvokeMiddleware(self.Name .. "_Outgoing", nil, data)
 	if not continueProcessing then
@@ -406,12 +391,6 @@ function ServerEvent:FireFilteredClients(filter: (player: Player) -> boolean, da
 
 	if #playersToSend == 0 then return end
 
-	if not data then
-		for _, plr in playersToSend do
-			self.RemoteEvent:FireClient(plr)
-		end
-	end
-	
 	-- 3. Middleware (Outgoing)
 	local continueProcessing, processedData = self.ServerManager:InvokeMiddleware(self.Name .. "_Outgoing", nil, data)
 	if not continueProcessing then

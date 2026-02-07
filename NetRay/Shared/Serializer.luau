@@ -70,8 +70,10 @@ type SerializerMetrics = {
 -- Type for the main module export
 export type NetRaySerializerModule = {
 	Serialize: (data: any) -> SerializedResult?, -- Returns buffer on success, nil on error
-	Deserialize: (buf: buffer) -> any?, -- Returns deserialized value or nil on error
+	Deserialize: (buf: buffer, instances: {Instance}?) -> any?, -- Returns deserialized value or nil on error
 	EstimateSize: (data: any) -> number, -- Returns estimated byte size
+	WriteValue: (cursor: Cursor, data: any) -> (),
+	ReadValue: (cursor: Cursor) -> any,
 	GetMetrics: () -> SerializerMetrics,
 	ResetMetrics: () -> (),
 	ClearCache: () -> (), -- Placeholder
@@ -328,7 +330,7 @@ function NetRaySerializer.Serialize(data: any): SerializedResult?
 
 	local estimatedSize = NetRaySerializer.EstimateSize(data)
 	local bufferInstance = bufferCreate(mathMax(estimatedSize, 16)) -- Use local name
-	local cursor = CursorModule(bufferInstance) -- Assume Cursor constructor
+	local cursor = CursorModule(bufferInstance, {}) -- Assume Cursor constructor
 
 	local success, err = pcall(writeTypedValue, cursor, data)
 
@@ -345,7 +347,7 @@ function NetRaySerializer.Serialize(data: any): SerializedResult?
 end
 
 -- Deserialize Public Method
-function NetRaySerializer.Deserialize(buf: buffer): any?
+function NetRaySerializer.Deserialize(buf: buffer, instances: {Instance}?): any?
 	metrics.deserializeCount += 1
 	local startTime = tick()
 	local result: any = nil
@@ -355,7 +357,7 @@ function NetRaySerializer.Deserialize(buf: buffer): any?
 		metrics.totalDeserializeTime += (tick() - startTime); metrics.errors += 1; return nil
 	end
 
-	local cursor = CursorModule(buf) -- Assume Cursor constructor
+	local cursor = CursorModule(buf, instances or {}) -- Assume Cursor constructor
 	local success, valueOrError = pcall(readTypedValue, cursor)
 
 	if success then
@@ -377,6 +379,14 @@ function NetRaySerializer.Deserialize(buf: buffer): any?
 
 	metrics.totalDeserializeTime += (tick() - startTime)
 	return result
+end
+
+function NetRaySerializer.WriteValue(cursor: Cursor, data: any)
+	writeTypedValue(cursor, data)
+end
+
+function NetRaySerializer.ReadValue(cursor: Cursor): any
+	return readTypedValue(cursor)
 end
 
 -- EstimateSize Public Method
