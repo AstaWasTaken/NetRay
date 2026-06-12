@@ -1,288 +1,781 @@
 --!optimize 2
 --!native
 
--- BinaryEncoder.lua (Revised for LZ4 Compatibility, Cyclic References, Pack Formats, Recursion Fixes, and Integer Check)
+-- BinaryEncoder.lua
+-- Revised for 64-bit numeric support, cyclic references, robust instance paths,
+-- legacy payload decoding, and stricter malformed-input handling.
 -- Author: Asta (@TheYusufGamer)
--- Version: v1.5.4 (Fixed instance handling)
+-- Version: v1.6.0
 
 local BinaryEncoder = {}
 
--- Binary type identifiers 
+-- Existing identifiers are intentionally unchanged for backward compatibility.
+-- New identifiers are appended so payloads written by older versions remain readable.
 local TYPE = {
-	NIL = 0, BOOLEAN_FALSE = 1, BOOLEAN_TRUE = 2, NUMBER_INT8 = 3, NUMBER_INT16 = 4,
-	NUMBER_INT32 = 5, NUMBER_FLOAT32 = 6, STRING_SHORT = 7, STRING_LONG = 8, TABLE_START = 9,
-	TABLE_END = 10, ARRAY_START = 11, ARRAY_END = 12, REFERENCE = 13, VECTOR3 = 14,
-	COLOR3 = 15, UDIM2 = 16, CFRAME = 17, VECTOR2 = 18, RECT = 19, ENUM = 20,
-	INSTANCE_REF = 21, DATETIME = 22, BRICKCOLOR = 23, NUMBERSEQUENCE = 24, COLORSEQUENCE = 25,
-	BUFFER = 26, ARRAY_HOMOGENEOUS = 27, VALUE_TYPE_ID = 28, NUMBER_ZERO = 29, STRING_EMPTY = 30,
+	NIL = 0,
+	BOOLEAN_FALSE = 1,
+	BOOLEAN_TRUE = 2,
+	NUMBER_INT8 = 3,
+	NUMBER_INT16 = 4,
+	NUMBER_INT32 = 5,
+	NUMBER_FLOAT32 = 6, -- Legacy decoder support. New values use FLOAT64.
+	STRING_SHORT = 7,
+	STRING_LONG = 8,
+	TABLE_START = 9,
+	TABLE_END = 10,
+	ARRAY_START = 11,
+	ARRAY_END = 12,
+	REFERENCE = 13,
+	VECTOR3 = 14,
+	COLOR3 = 15,
+	UDIM2 = 16,
+	CFRAME = 17,
+	VECTOR2 = 18,
+	RECT = 19,
+	ENUM = 20,
+	INSTANCE_REF = 21,
+	DATETIME = 22,
+	BRICKCOLOR = 23,
+	NUMBERSEQUENCE = 24,
+	COLORSEQUENCE = 25,
+	BUFFER = 26,
+	ARRAY_HOMOGENEOUS = 27,
+	VALUE_TYPE_ID = 28,
+	NUMBER_ZERO = 29,
+	STRING_EMPTY = 30,
+	NUMBER_INT64 = 31,
+	NUMBER_FLOAT64 = 32,
 }
 
--- HOMOGENEOUS_TYPE_MAP 
 local HOMOGENEOUS_TYPE_MAP = {
-	["number"] = TYPE.NUMBER_FLOAT32, ["string"] = TYPE.STRING_SHORT, ["Vector3"] = TYPE.VECTOR3,
-	["Vector2"] = TYPE.VECTOR2, ["Color3"] = TYPE.COLOR3, ["boolean"] = TYPE.BOOLEAN_FALSE,
-	["CFrame"] = TYPE.CFRAME, ["UDim2"] = TYPE.UDIM2, ["Rect"] = TYPE.RECT, ["EnumItem"] = TYPE.ENUM,
-	["BrickColor"] = TYPE.BRICKCOLOR, ["DateTime"] = TYPE.DATETIME, ["buffer"] = TYPE.BUFFER,
+	number = TYPE.NUMBER_FLOAT64,
+	string = TYPE.STRING_SHORT,
+	boolean = TYPE.BOOLEAN_FALSE,
+	Vector3 = TYPE.VECTOR3,
+	Vector2 = TYPE.VECTOR2,
+	Color3 = TYPE.COLOR3,
+	CFrame = TYPE.CFRAME,
+	UDim2 = TYPE.UDIM2,
+	Rect = TYPE.RECT,
+	EnumItem = TYPE.ENUM,
+	BrickColor = TYPE.BRICKCOLOR,
+	DateTime = TYPE.DATETIME,
+	buffer = TYPE.BUFFER,
 }
 
--- Roblox Globals Cache 
-local Vector3_new = Vector3.new; local Vector2_new = Vector2.new; local Color3_new = Color3.new
-local UDim2_new = UDim2.new; local Rect_new = Rect.new; local CFrame_new = CFrame.new
-local Enum_Type = Enum; local DateTime_FromMillis = DateTime.fromUnixTimestampMillis
-local BrickColor_new = BrickColor.new; local NumberSequence_new = NumberSequence.new
-local ColorSequence_new = ColorSequence.new; local NumberSequenceKeypoint_new = NumberSequenceKeypoint.new
-local ColorSequenceKeypoint_new = ColorSequenceKeypoint.new; local buffer_len = buffer.len
-local buffer_tostring = buffer.tostring; local buffer_fromstring = buffer.fromstring
-local string_pack = string.pack; local string_unpack = string.unpack; local string_sub = string.sub
-local string_byte = string.byte; local string_char = string.char; local table_insert = table.insert
-local table_concat = table.concat; local pairs = pairs; local ipairs = ipairs; local type = type
-local typeof = typeof; local math_floor = math.floor; local math_max = math.max
-local math_abs = math.abs; local pcall = pcall; local warn = warn; local error = error
+-- Roblox globals and common functions cached for hot paths.
+local Vector3_new = Vector3.new
+local Vector2_new = Vector2.new
+local Color3_new = Color3.new
+local UDim2_new = UDim2.new
+local Rect_new = Rect.new
+local CFrame_new = CFrame.new
+local Enum_Type = Enum
+local DateTime_FromMillis = DateTime.fromUnixTimestampMillis
+local BrickColor_new = BrickColor.new
+local NumberSequence_new = NumberSequence.new
+local ColorSequence_new = ColorSequence.new
+local NumberSequenceKeypoint_new = NumberSequenceKeypoint.new
+local ColorSequenceKeypoint_new = ColorSequenceKeypoint.new
+
+local buffer_len = buffer.len
+local buffer_tostring = buffer.tostring
+local buffer_fromstring = buffer.fromstring
+local string_pack = string.pack
+local string_unpack = string.unpack
+local string_sub = string.sub
+local string_byte = string.byte
+local string_char = string.char
+local string_gmatch = string.gmatch
+local string_match = string.match
+local table_insert = table.insert
+local table_concat = table.concat
+local table_remove = table.remove
+local table_unpack = table.unpack
+local pairs = pairs
+local ipairs = ipairs
+local type = type
+local typeof = typeof
+local math_floor = math.floor
+local math_max = math.max
+local math_abs = math.abs
+local pcall = pcall
+local warn = warn
+local error = error
 local tostring = tostring
 
--- Reuse string characters Cache 
 local CHAR_CACHE = {}
-for i = 0, 255 do CHAR_CACHE[i] = string_char(i) end
+for i = 0, 255 do
+	CHAR_CACHE[i] = string_char(i)
+end
 
--- Recursion depth limit 
 local MAX_DEPTH = 500
+local MAX_UINT32 = 4294967295
+-- Luau numbers are IEEE-754 doubles. Integers are exact only through 2^53 - 1.
+local MAX_SAFE_INTEGER = 9007199254740991
 
--- Error formatting helper 
-local function encodingError(msg: string, currentDepth: number): nil error(("[BE Enc Err d%d] %s"):format(currentDepth, msg), 3) return nil end
-local function decodingError(msg: string, index: number): nil error(("[BE Dec Err @%d] %s"):format(index, msg), 3) return nil end
+local function encodingError(message: string, currentDepth: number?): never
+	error(("[BE Enc Err d%d] %s"):format(currentDepth or 0, message), 3)
+end
 
---[[ Helper: isInteger ]]
-local function isInteger(value: number): boolean return math_abs(value - math_floor(value)) < 0.00001 end
+local function decodingError(message: string, index: number): never
+	error(("[BE Dec Err @%d] %s"):format(index, message), 3)
+end
 
--- Helper to write/read length 
-local function writeLength(len: number): string if len < 255 then return CHAR_CACHE[len] else return CHAR_CACHE[255] .. string_pack(">I4", len) end end
-local function readLength(data: string, index: number): (number?, number?) local b=string_byte(data,index); if not b then return decodingError("readLen byte",index) end; index+=1; if b<255 then return b,index else if index+3>#data then return decodingError("readLen data",index) end; local l,ni=string_unpack(">I4",data,index); if not l then return decodingError("readLen unpack",index) end; return l,ni end end
+local function isExactInteger(value: number): boolean
+	return value == math_floor(value) and math_abs(value) <= MAX_SAFE_INTEGER
+end
 
---[[ Helper: Get Instance Path ]]
-local function getInstancePath(instance: Instance): string?
-	if not instance then return nil end -- Handle nil input gracefully
-
-	local names = {}
-	local current: Instance? = instance
-	local gameService = game -- Cache the global
-
-	-- Walk up the hierarchy until 'game' or nil is reached
-	while current and current ~= gameService do
-		-- Check for invalid characters in names if necessary, though usually not an issue
-		-- if string.find(current.Name, ".", 1, true) then
-		--     warn("[BE Enc] Instance name contains '.' which might break pathfinding:", current:GetFullName())
-		-- end
-		table_insert(names, 1, current.Name) -- Prepend name
-		current = current.Parent
-	end
-
-	-- If the loop stopped because we hit 'game', the path is valid relative to game
-	if current == gameService then
-		return table_concat(names, ".")
-	else
-		-- Instance is not a descendant of game (e.g., parented to nil, CoreGui, etc.)
-		-- These often cannot or should not be reliably serialized by path.
-		warn(("[BE Enc] Instance %q is not a descendant of game, cannot create serializable path."):format(tostring(instance)))
-		return nil
+local function ensureBytes(data: string, index: number, byteCount: number, label: string)
+	if index + byteCount - 1 > #data then
+		decodingError("EOF " .. label, index)
 	end
 end
 
---[[ Helper: Get Instance At Path ]]
-function GetInstanceAtPath(path)
-	local current = game
-	for segment in string.gmatch(path, "[^%.]+") do
-		current = current:FindFirstChild(segment)
-		if not current then
+local function writeLength(length: number): string
+	if length < 0 or length > MAX_UINT32 or length ~= math_floor(length) then
+		encodingError("Length is outside uint32 range: " .. tostring(length), 0)
+	end
+
+	if length < 255 then
+		return CHAR_CACHE[length]
+	end
+
+	return CHAR_CACHE[255] .. string_pack(">I4", length)
+end
+
+local function readLength(data: string, index: number): (number, number)
+	local firstByte = string_byte(data, index)
+	if firstByte == nil then
+		decodingError("readLength byte", index)
+	end
+
+	index += 1
+	if firstByte < 255 then
+		return firstByte, index
+	end
+
+	ensureBytes(data, index, 4, "readLength uint32")
+	local length, nextIndex = string_unpack(">I4", data, index)
+	return length, nextIndex
+end
+
+local function getInstancePathSegments(instance: Instance): {string}?
+	local segments = {}
+	local current: Instance? = instance
+
+	while current and current ~= game do
+		table_insert(segments, 1, current.Name)
+		current = current.Parent
+	end
+
+	if current ~= game then
+		warn(("[BE Enc] Instance %q is not a descendant of game; encoding nil."):format(tostring(instance)))
+		return nil
+	end
+
+	return segments
+end
+
+local function getInstanceAtSegments(segments: {any}): Instance?
+	local current: Instance = game
+
+	for _, segment in ipairs(segments) do
+		if type(segment) ~= "string" then
 			return nil
 		end
+
+		local child = current:FindFirstChild(segment)
+		if not child then
+			return nil
+		end
+		current = child
+	end
+
+	return current
+end
+
+-- Legacy instance payloads used dot-separated strings. New payloads use an array
+-- of exact path segments so names containing periods work correctly.
+local function getLegacyInstanceAtPath(path: string): Instance?
+	local current: Instance = game
+	for segment in string_gmatch(path, "[^%.]+") do
+		local child = current:FindFirstChild(segment)
+		if not child then
+			return nil
+		end
+		current = child
 	end
 	return current
 end
 
---[[--- Internal Encoding Logic ---]]
-local function encodeValue(value: any, refs_encoding: {}, buffer: {string}, currentDepth: number)
+type EncoderState = {
+	refs: {[any]: number},
+	nextRefId: number,
+}
 
-	if currentDepth > MAX_DEPTH then return encodingError("Max depth", currentDepth) end
+local encodeValue
+
+encodeValue = function(value: any, state: EncoderState, output: {string}, currentDepth: number)
+	if currentDepth > MAX_DEPTH then
+		encodingError("Maximum recursion depth exceeded", currentDepth)
+	end
 
 	local valueType = typeof(value)
 	local rawType = type(value)
 
-	if value == nil then table_insert(buffer, CHAR_CACHE[TYPE.NIL])
-	elseif rawType == "boolean" then table_insert(buffer, CHAR_CACHE[value and TYPE.BOOLEAN_TRUE or TYPE.BOOLEAN_FALSE])
+	if value == nil then
+		table_insert(output, CHAR_CACHE[TYPE.NIL])
+	elseif rawType == "boolean" then
+		table_insert(output, CHAR_CACHE[value and TYPE.BOOLEAN_TRUE or TYPE.BOOLEAN_FALSE])
 	elseif rawType == "number" then
-		if value == 0 then table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_ZERO])
-		elseif isInteger(value) then
-			if value >= -128 and value <= 127 then table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_INT8]); table_insert(buffer, string_pack("<i1", value))
-			elseif value >= -32768 and value <= 32767 then table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_INT16]); table_insert(buffer, string_pack("<i2", value))
-			elseif value >= -2147483648 and value <= 2147483647 then table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_INT32]); table_insert(buffer, string_pack("<i4", value))
-			else warn("[BE Enc] Int >32bit->Float32:", value); table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_FLOAT32]); table_insert(buffer, string_pack("<f", value)) end
-		else table_insert(buffer, CHAR_CACHE[TYPE.NUMBER_FLOAT32]); table_insert(buffer, string_pack("<f", value)) end
-	elseif rawType == "string" then
-		local len = #value; if len == 0 then table_insert(buffer, CHAR_CACHE[TYPE.STRING_EMPTY])
-		else local lb=writeLength(len); table_insert(buffer, CHAR_CACHE[#lb==1 and TYPE.STRING_SHORT or TYPE.STRING_LONG]); table_insert(buffer,lb); table_insert(buffer, value) end
-	elseif rawType == "table" then
-		local ref_id = refs_encoding[value]; if ref_id then table_insert(buffer, CHAR_CACHE[TYPE.REFERENCE]); encodeValue(ref_id, refs_encoding, buffer, currentDepth + 1)
+		if value == 0 then
+			table_insert(output, CHAR_CACHE[TYPE.NUMBER_ZERO])
+		elseif isExactInteger(value) then
+			if value >= -128 and value <= 127 then
+				table_insert(output, CHAR_CACHE[TYPE.NUMBER_INT8])
+				table_insert(output, string_pack("<i1", value))
+			elseif value >= -32768 and value <= 32767 then
+				table_insert(output, CHAR_CACHE[TYPE.NUMBER_INT16])
+				table_insert(output, string_pack("<i2", value))
+			elseif value >= -2147483648 and value <= 2147483647 then
+				table_insert(output, CHAR_CACHE[TYPE.NUMBER_INT32])
+				table_insert(output, string_pack("<i4", value))
+			else
+				table_insert(output, CHAR_CACHE[TYPE.NUMBER_INT64])
+				table_insert(output, string_pack("<i8", value))
+			end
 		else
-			local current_ref_id = #refs_encoding + 1; refs_encoding[value] = current_ref_id
-			local count, max_idx, is_dictionary = 0, 0, false
-			for k in pairs(value) do count += 1; if type(k) == "number" and k >= 1 and math_floor(k) == k then max_idx = math_max(max_idx, k) else is_dictionary = true end end
-			if not is_dictionary and count > 0 and max_idx > count * 2 and max_idx > 10 then is_dictionary = true end -- Sparse check
+			table_insert(output, CHAR_CACHE[TYPE.NUMBER_FLOAT64])
+			table_insert(output, string_pack("<d", value))
+		end
+	elseif rawType == "string" then
+		local length = #value
+		if length == 0 then
+			table_insert(output, CHAR_CACHE[TYPE.STRING_EMPTY])
+		else
+			local encodedLength = writeLength(length)
+			table_insert(output, CHAR_CACHE[#encodedLength == 1 and TYPE.STRING_SHORT or TYPE.STRING_LONG])
+			table_insert(output, encodedLength)
+			table_insert(output, value)
+		end
+	elseif rawType == "table" then
+		local referenceId = state.refs[value]
+		if referenceId ~= nil then
+			table_insert(output, CHAR_CACHE[TYPE.REFERENCE])
+			encodeValue(referenceId, state, output, currentDepth + 1)
+			return
+		end
 
-			if not is_dictionary and count == max_idx then -- Array
-				if count == 0 then table_insert(buffer, CHAR_CACHE[TYPE.ARRAY_START]); table_insert(buffer, CHAR_CACHE[TYPE.ARRAY_END])
-				else
-					local fV, is_homo, fVTI, fVRT, fVTo = value[1], true, nil, nil, nil
-					fVRT = type(fV); fVTo = typeof(fV); local tidfc = HOMOGENEOUS_TYPE_MAP[fVTo]
-					if count > 1 and tidfc then
-						fVTI = tidfc; local isFBool = fVTo=="boolean"
-						for i = 2, count do local cV = value[i]; local cVTo = typeof(cV); if cVTo ~= fVTo and not (isFBool and cVTo == "boolean") then is_homo = false; break end; if fVRT == "number" and type(cV) ~= "number" then is_homo = false; break end end
-					else is_homo = false end
+		state.refs[value] = state.nextRefId
+		state.nextRefId += 1
 
-					if is_homo and fVTI then -- Homo Array
-						table_insert(buffer, CHAR_CACHE[TYPE.ARRAY_HOMOGENEOUS]); local ttw = (fVTI==TYPE.BOOLEAN_TRUE or fVTI==TYPE.BOOLEAN_FALSE) and TYPE.BOOLEAN_FALSE or fVTI
-						table_insert(buffer, CHAR_CACHE[ttw]); table_insert(buffer, CHAR_CACHE[TYPE.VALUE_TYPE_ID]); encodeValue(count, refs_encoding, buffer, currentDepth + 1)
-						if ttw == TYPE.NUMBER_FLOAT32 then for i=1,count do local n=value[i]; if n==0 then table_insert(buffer,CHAR_CACHE[TYPE.NUMBER_ZERO]) else table_insert(buffer,string_pack("<f",n)) end end
-						elseif ttw == TYPE.BOOLEAN_FALSE then for i=1,count do table_insert(buffer,CHAR_CACHE[value[i] and TYPE.BOOLEAN_TRUE or TYPE.BOOLEAN_FALSE]) end
-						elseif ttw == TYPE.STRING_SHORT then for i=1, count do encodeValue(value[i], refs_encoding, buffer, currentDepth + 1) end
-						else for i=1, count do encodeValue(value[i], refs_encoding, buffer, currentDepth + 1) end end
-					else -- Regular Array
-						table_insert(buffer, CHAR_CACHE[TYPE.ARRAY_START]); for i=1, count do encodeValue(value[i], refs_encoding, buffer, currentDepth + 1) end; table_insert(buffer, CHAR_CACHE[TYPE.ARRAY_END])
+		local count = 0
+		local maxIndex = 0
+		local isDictionary = false
+
+		for key in pairs(value) do
+			count += 1
+			if type(key) == "number" and key >= 1 and key == math_floor(key) then
+				maxIndex = math_max(maxIndex, key)
+			else
+				isDictionary = true
+			end
+		end
+
+		if not isDictionary and count > 0 and maxIndex > count * 2 and maxIndex > 10 then
+			isDictionary = true
+		end
+
+		if not isDictionary and count == maxIndex then
+			if count == 0 then
+				table_insert(output, CHAR_CACHE[TYPE.ARRAY_START])
+				table_insert(output, CHAR_CACHE[TYPE.ARRAY_END])
+				return
+			end
+
+			local firstValue = value[1]
+			local firstValueType = typeof(firstValue)
+			local homogeneousTypeId = HOMOGENEOUS_TYPE_MAP[firstValueType]
+			local isHomogeneous = count > 1 and homogeneousTypeId ~= nil
+
+			if isHomogeneous then
+				for i = 2, count do
+					if typeof(value[i]) ~= firstValueType then
+						isHomogeneous = false
+						break
 					end
 				end
-			else -- Dictionary
-				table_insert(buffer, CHAR_CACHE[TYPE.TABLE_START])
-				for k, v in pairs(value) do local kt=type(k); if kt=="string" or kt=="number" then encodeValue(k, refs_encoding, buffer, currentDepth+1); encodeValue(v, refs_encoding, buffer, currentDepth+1) else warn("[BE Enc] Skip table key:", kt, k) end end
-				table_insert(buffer, CHAR_CACHE[TYPE.TABLE_END])
 			end
-		end
-		-- Roblox Types (Standardized pack formats)
-	elseif valueType == "Vector3" then table_insert(buffer,CHAR_CACHE[TYPE.VECTOR3]); table_insert(buffer, string_pack("<ddd", value.X, value.Y, value.Z)) -- FIX: <ddd
-	elseif valueType == "Vector2" then table_insert(buffer,CHAR_CACHE[TYPE.VECTOR2]); table_insert(buffer, string_pack("<dd", value.X, value.Y))             -- FIX: <dd
-	elseif valueType == "Color3" then table_insert(buffer,CHAR_CACHE[TYPE.COLOR3]); table_insert(buffer, string_pack("<ddd", value.R, value.G, value.B))   -- FIX: <ddd
-	elseif valueType == "UDim2" then table_insert(buffer,CHAR_CACHE[TYPE.UDIM2]); table_insert(buffer, string_pack("<dddd", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)) -- FIX: <dddd
-	elseif valueType == "Rect" then table_insert(buffer,CHAR_CACHE[TYPE.RECT]); table_insert(buffer, string_pack("<dddd", value.Min.X, value.Min.Y, value.Max.X, value.Max.Y))       -- FIX: <dddd
-	elseif valueType == "CFrame" then table_insert(buffer,CHAR_CACHE[TYPE.CFRAME]); table_insert(buffer, string_pack("<dddddddddddd", value:GetComponents())) -- FIX: <d * 12
-	elseif valueType == "EnumItem" then table_insert(buffer,CHAR_CACHE[TYPE.ENUM]); encodeValue(tostring(value.EnumType), refs_encoding, buffer, currentDepth+1); encodeValue(tostring(value.Name), refs_encoding, buffer, currentDepth+1)
-	elseif valueType == "Instance" then
-		-- Use the robust path function (Unchanged)
-		local path = getInstancePath(value)
-		if path then
-			if path == "" then
-				warn("[BE Enc] Instance path resulted in empty string for:", value)
-				table_insert(buffer, CHAR_CACHE[TYPE.NIL])
+
+			if isHomogeneous and homogeneousTypeId then
+				table_insert(output, CHAR_CACHE[TYPE.ARRAY_HOMOGENEOUS])
+				table_insert(output, CHAR_CACHE[homogeneousTypeId])
+				table_insert(output, CHAR_CACHE[TYPE.VALUE_TYPE_ID])
+				encodeValue(count, state, output, currentDepth + 1)
+
+				if homogeneousTypeId == TYPE.NUMBER_FLOAT64 then
+					-- Fixed-width values avoid the legacy FLOAT32 zero-marker ambiguity.
+					for i = 1, count do
+						table_insert(output, string_pack("<d", value[i]))
+					end
+				elseif homogeneousTypeId == TYPE.BOOLEAN_FALSE then
+					for i = 1, count do
+						table_insert(output, CHAR_CACHE[value[i] and TYPE.BOOLEAN_TRUE or TYPE.BOOLEAN_FALSE])
+					end
+				else
+					for i = 1, count do
+						encodeValue(value[i], state, output, currentDepth + 1)
+					end
+				end
 			else
-				table_insert(buffer, CHAR_CACHE[TYPE.INSTANCE_REF])
-				encodeValue(path, refs_encoding, buffer, currentDepth + 1)
+				table_insert(output, CHAR_CACHE[TYPE.ARRAY_START])
+				for i = 1, count do
+					encodeValue(value[i], state, output, currentDepth + 1)
+				end
+				table_insert(output, CHAR_CACHE[TYPE.ARRAY_END])
 			end
 		else
-			-- getInstancePath already warned if it couldn't generate a path
-			table_insert(buffer, CHAR_CACHE[TYPE.NIL]) -- Encode as nil if path generation failed
+			table_insert(output, CHAR_CACHE[TYPE.TABLE_START])
+			for key, childValue in pairs(value) do
+				local keyType = type(key)
+				if keyType == "string" or keyType == "number" then
+					encodeValue(key, state, output, currentDepth + 1)
+					encodeValue(childValue, state, output, currentDepth + 1)
+				else
+					warn("[BE Enc] Skipping unsupported table key:", keyType, key)
+				end
+			end
+			table_insert(output, CHAR_CACHE[TYPE.TABLE_END])
 		end
-	elseif valueType == "DateTime" then table_insert(buffer,CHAR_CACHE[TYPE.DATETIME]); table_insert(buffer, string_pack("<q", value.UnixTimestampMillis))
-	elseif valueType == "BrickColor" then table_insert(buffer,CHAR_CACHE[TYPE.BRICKCOLOR]); encodeValue(value.Number, refs_encoding, buffer, currentDepth+1)
-	elseif valueType == "NumberSequence" then table_insert(buffer,CHAR_CACHE[TYPE.NUMBERSEQUENCE]); local kp=value.Keypoints; encodeValue(#kp, refs_encoding, buffer, currentDepth+1); for _,k in ipairs(kp) do table_insert(buffer, string_pack("<ddd", k.Time, k.Value, k.Envelope)) end -- Kept <ddd
-	elseif valueType == "ColorSequence" then table_insert(buffer,CHAR_CACHE[TYPE.COLORSEQUENCE]); local kp=value.Keypoints; encodeValue(#kp, refs_encoding, buffer, currentDepth+1); for _,k in ipairs(kp) do table_insert(buffer, string_pack("<dddd", k.Time, k.Value.R, k.Value.G, k.Value.B)) end -- Kept <dddd
-	elseif valueType == "buffer" then table_insert(buffer, CHAR_CACHE[TYPE.BUFFER]); local l=buffer_len(value); local lb=writeLength(l); table_insert(buffer,lb); table_insert(buffer, buffer_tostring(value))
-	else warn("[BE Enc] Unsupported:", valueType, value); table_insert(buffer, CHAR_CACHE[TYPE.NIL])
+	elseif valueType == "Vector3" then
+		table_insert(output, CHAR_CACHE[TYPE.VECTOR3])
+		table_insert(output, string_pack("<ddd", value.X, value.Y, value.Z))
+	elseif valueType == "Vector2" then
+		table_insert(output, CHAR_CACHE[TYPE.VECTOR2])
+		table_insert(output, string_pack("<dd", value.X, value.Y))
+	elseif valueType == "Color3" then
+		table_insert(output, CHAR_CACHE[TYPE.COLOR3])
+		table_insert(output, string_pack("<ddd", value.R, value.G, value.B))
+	elseif valueType == "UDim2" then
+		table_insert(output, CHAR_CACHE[TYPE.UDIM2])
+		table_insert(output, string_pack("<dddd", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset))
+	elseif valueType == "Rect" then
+		table_insert(output, CHAR_CACHE[TYPE.RECT])
+		table_insert(output, string_pack("<dddd", value.Min.X, value.Min.Y, value.Max.X, value.Max.Y))
+	elseif valueType == "CFrame" then
+		table_insert(output, CHAR_CACHE[TYPE.CFRAME])
+		table_insert(output, string_pack("<dddddddddddd", value:GetComponents()))
+	elseif valueType == "EnumItem" then
+		local enumTypeName = string_match(tostring(value.EnumType), "^Enum%.(.+)$") or tostring(value.EnumType)
+		table_insert(output, CHAR_CACHE[TYPE.ENUM])
+		encodeValue(enumTypeName, state, output, currentDepth + 1)
+		encodeValue(value.Name, state, output, currentDepth + 1)
+	elseif valueType == "Instance" then
+		local segments = getInstancePathSegments(value)
+		if segments then
+			table_insert(output, CHAR_CACHE[TYPE.INSTANCE_REF])
+			encodeValue(segments, state, output, currentDepth + 1)
+		else
+			table_insert(output, CHAR_CACHE[TYPE.NIL])
+		end
+	elseif valueType == "DateTime" then
+		table_insert(output, CHAR_CACHE[TYPE.DATETIME])
+		table_insert(output, string_pack("<i8", value.UnixTimestampMillis))
+	elseif valueType == "BrickColor" then
+		table_insert(output, CHAR_CACHE[TYPE.BRICKCOLOR])
+		encodeValue(value.Number, state, output, currentDepth + 1)
+	elseif valueType == "NumberSequence" then
+		local keypoints = value.Keypoints
+		table_insert(output, CHAR_CACHE[TYPE.NUMBERSEQUENCE])
+		encodeValue(#keypoints, state, output, currentDepth + 1)
+		for _, keypoint in ipairs(keypoints) do
+			table_insert(output, string_pack("<ddd", keypoint.Time, keypoint.Value, keypoint.Envelope))
+		end
+	elseif valueType == "ColorSequence" then
+		local keypoints = value.Keypoints
+		table_insert(output, CHAR_CACHE[TYPE.COLORSEQUENCE])
+		encodeValue(#keypoints, state, output, currentDepth + 1)
+		for _, keypoint in ipairs(keypoints) do
+			table_insert(output, string_pack("<dddd", keypoint.Time, keypoint.Value.R, keypoint.Value.G, keypoint.Value.B))
+		end
+	elseif valueType == "buffer" then
+		local length = buffer_len(value)
+		table_insert(output, CHAR_CACHE[TYPE.BUFFER])
+		table_insert(output, writeLength(length))
+		table_insert(output, buffer_tostring(value))
+	else
+		warn("[BE Enc] Unsupported value type; encoding nil:", valueType, value)
+		table_insert(output, CHAR_CACHE[TYPE.NIL])
 	end
 end
 
+local decodeValue
 
---[[--- Internal Decoding Logic ---]]
-local function decodeValue(data: string, indexRef: {number}, refs_decoding: {}, currentDepth: number)
+decodeValue = function(data: string, indexRef: {number}, refs: {any}, currentDepth: number): any
+	if currentDepth > MAX_DEPTH then
+		decodingError("Maximum recursion depth exceeded", indexRef[1])
+	end
 
-	if currentDepth > MAX_DEPTH then return decodingError("Max depth", indexRef[1]) end
-	local index = indexRef[1]; if index > #data then return decodingError("EOF start", index) end
-	local typeId = string_byte(data, index); if not typeId then return decodingError("EOF TypeID", index) end
-	index += 1; indexRef[1] = index
+	local index = indexRef[1]
+	ensureBytes(data, index, 1, "TypeID")
+	local typeId = string_byte(data, index)
+	index += 1
+	indexRef[1] = index
 
-	if typeId == TYPE.NIL then return nil
-	elseif typeId == TYPE.BOOLEAN_FALSE then return false
-	elseif typeId == TYPE.BOOLEAN_TRUE then return true
-	elseif typeId == TYPE.NUMBER_ZERO then return 0
-	elseif typeId == TYPE.STRING_EMPTY then return ""
-	elseif typeId == TYPE.NUMBER_INT8 then if index>#data then return decodingError("EOF I8",index) end; local v,idx=string_unpack("<i1",data,index); if not idx then return decodingError("Unpk I8",index) end; indexRef[1]=idx; return v
-	elseif typeId == TYPE.NUMBER_INT16 then if index+1>#data then return decodingError("EOF I16",index) end; local v,idx=string_unpack("<i2",data,index); if not idx then return decodingError("Unpk I16",index) end; indexRef[1]=idx; return v
-	elseif typeId == TYPE.NUMBER_INT32 then if index+3>#data then return decodingError("EOF I32",index) end; local v,idx=string_unpack("<i4",data,index); if not idx then return decodingError("Unpk I32",index) end; indexRef[1]=idx; return v
-	elseif typeId == TYPE.NUMBER_FLOAT32 then if index+3>#data then return decodingError("EOF F32",index) end; local v,idx=string_unpack("<f",data,index); if not idx then return decodingError("Unpk F32",index) end; indexRef[1]=idx; return v
-	elseif typeId == TYPE.STRING_SHORT or typeId == TYPE.STRING_LONG then local l,il=readLength(data,indexRef[1]); if not l then return nil end; local eos=il+l; if eos>#data+1 then return decodingError("Str OOB "..l,il) end; local s=string_sub(data,il,eos-1); indexRef[1]=eos; return s
-	elseif typeId == TYPE.REFERENCE then local rid=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(rid)~="number" then return decodingError("RefID type "..type(rid), indexRef[1]) end; local v=refs_decoding[rid]; if v==nil then return decodingError("RefID inv "..rid, indexRef[1]) end; return v
-	elseif typeId == TYPE.TABLE_START then local tbl={}; local id=#refs_decoding+1; refs_decoding[id]=tbl; while true do if indexRef[1]>#data then return decodingError("EOF TBL", indexRef[1]) end; local p=string_byte(data,indexRef[1]); if not p then return decodingError("Peek TBL", indexRef[1]) end; if p==TYPE.TABLE_END then indexRef[1]+=1; break end; local k=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if indexRef[1]>#data and string_byte(data, indexRef[1])~=TYPE.TABLE_END then return decodingError("EOF TBL Key", indexRef[1]) end; local v=decodeValue(data,indexRef,refs_decoding,currentDepth+1); tbl[k]=v end; return tbl
-	elseif typeId == TYPE.ARRAY_START then local arr={}; local id=#refs_decoding+1; refs_decoding[id]=arr; local i=1; while true do if indexRef[1]>#data then return decodingError("EOF ARR", indexRef[1]) end; local p=string_byte(data,indexRef[1]); if not p then return decodingError("Peek ARR", indexRef[1]) end; if p==TYPE.ARRAY_END then indexRef[1]+=1; break end; arr[i]=decodeValue(data,indexRef,refs_decoding,currentDepth+1); i+=1 end; return arr
-	elseif typeId == TYPE.ARRAY_HOMOGENEOUS then local arr={}; local id=#refs_decoding+1; refs_decoding[id]=arr; index=indexRef[1]; if index+1>#data then return decodingError("EOF HomoHdr",index) end; local vtid=string_byte(data,index); index+=1; local sep=string_byte(data,index); index+=1; indexRef[1]=index; if sep~=TYPE.VALUE_TYPE_ID then return decodingError("Homo Sep "..sep,index-1) end; local cnt=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(cnt)~="number" or cnt<0 or cnt~=math_floor(cnt) then return decodingError("Homo Cnt "..tostring(cnt), indexRef[1]) end
-		if cnt > 0 then index=indexRef[1]; local isBool=vtid==TYPE.BOOLEAN_FALSE or vtid==TYPE.BOOLEAN_TRUE; local evtid=isBool and TYPE.BOOLEAN_FALSE or vtid;
-			if evtid == TYPE.NUMBER_FLOAT32 then for i=1,cnt do if index>#data then return decodingError(("HomoNum EOF %d/%d"):format(i,cnt),index) end; local p=string_byte(data,index); if p==TYPE.NUMBER_ZERO then arr[i]=0; index+=1 else if index+3>#data then return decodingError(("HomoFlt EOF %d/%d"):format(i,cnt),index) end; local v,ni=string_unpack("<f",data,index); if not ni then return decodingError(("HomoFlt Unpk %d/%d"):format(i,cnt),index) end; arr[i]=v; index=ni end end
-			elseif isBool then if index+cnt>#data+1 then return decodingError(("HomoBool EOF %d/%d"):format(cnt,cnt),index) end; for i=1,cnt do local b=string_byte(data,index); arr[i]=(b==TYPE.BOOLEAN_TRUE); index+=1 end
-			elseif evtid == TYPE.STRING_SHORT then for i=1,cnt do indexRef[1]=index; local s=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(s)~="string" then return decodingError(("HomoStr Type %d/%d got %s"):format(i,cnt,type(s)),index) end; arr[i]=s; index=indexRef[1] end
-			else for i=1, cnt do indexRef[1]=index; arr[i]=decodeValue(data,indexRef,refs_decoding,currentDepth+1); index=indexRef[1] end
-			end; indexRef[1]=index
-		end; return arr
-		-- Roblox Types (Standardized unpack formats)
-	elseif typeId == TYPE.VECTOR3 then if indexRef[1]+23>#data then return decodingError("EOF VEC3",indexRef[1]) end; local x,y,z,idx=string_unpack("<ddd",data,indexRef[1]); if not idx then return decodingError("Unpk VEC3",indexRef[1]) end; indexRef[1]=idx; return Vector3_new(x,y,z) -- FIX: <ddd
-	elseif typeId == TYPE.VECTOR2 then if indexRef[1]+15>#data then return decodingError("EOF VEC2",indexRef[1]) end; local x,y,idx=string_unpack("<dd",data,indexRef[1]); if not idx then return decodingError("Unpk VEC2",indexRef[1]) end; indexRef[1]=idx; return Vector2_new(x,y)     -- FIX: <dd
-	elseif typeId == TYPE.COLOR3 then if indexRef[1]+23>#data then return decodingError("EOF COL3",indexRef[1]) end; local r,g,b,idx=string_unpack("<ddd",data,indexRef[1]); if not idx then return decodingError("Unpk COL3",indexRef[1]) end; indexRef[1]=idx; return Color3_new(r,g,b)    -- FIX: <ddd
-	elseif typeId == TYPE.UDIM2 then if indexRef[1]+31>#data then return decodingError("EOF UDIM2",indexRef[1]) end; local xs,xo,ys,yo,idx=string_unpack("<dddd",data,indexRef[1]); if not idx then return decodingError("Unpk UDIM2",indexRef[1]) end; indexRef[1]=idx; return UDim2_new(xs,xo,ys,yo) -- FIX: <dddd
-	elseif typeId == TYPE.RECT then if indexRef[1]+31>#data then return decodingError("EOF RECT",indexRef[1]) end; local nx,ny,xx,xy,idx=string_unpack("<dddd",data,indexRef[1]); if not idx then return decodingError("Unpk RECT",indexRef[1]) end; indexRef[1]=idx; return Rect_new(Vector2_new(nx,ny),Vector2_new(xx,xy)) -- FIX: <dddd
-	elseif typeId == TYPE.CFRAME then if indexRef[1]+95>#data then return decodingError("EOF CFRAME",indexRef[1]) end; local c={string_unpack("<dddddddddddd",data,indexRef[1])}; local idx=table.remove(c); if not idx then return decodingError("Unpk CFRAME",indexRef[1]) end; indexRef[1]=idx; return CFrame_new(table.unpack(c,1,12)) -- FIX: <d * 12
-	elseif typeId == TYPE.ENUM then local etn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); local evn=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(etn)~="string" or type(evn)~="string" then return decodingError("Enum str",indexRef[1]) end; local ok,ei=pcall(function()return Enum_Type[etn][evn]end); if ok and ei then return ei else warn("[BE Dec] Enum fail:",etn,evn); return nil end
+	if typeId == TYPE.NIL then
+		return nil
+	elseif typeId == TYPE.BOOLEAN_FALSE then
+		return false
+	elseif typeId == TYPE.BOOLEAN_TRUE then
+		return true
+	elseif typeId == TYPE.NUMBER_ZERO then
+		return 0
+	elseif typeId == TYPE.STRING_EMPTY then
+		return ""
+	elseif typeId == TYPE.NUMBER_INT8 then
+		ensureBytes(data, index, 1, "INT8")
+		local value, nextIndex = string_unpack("<i1", data, index)
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.NUMBER_INT16 then
+		ensureBytes(data, index, 2, "INT16")
+		local value, nextIndex = string_unpack("<i2", data, index)
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.NUMBER_INT32 then
+		ensureBytes(data, index, 4, "INT32")
+		local value, nextIndex = string_unpack("<i4", data, index)
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.NUMBER_INT64 then
+		ensureBytes(data, index, 8, "INT64")
+		local value, nextIndex = string_unpack("<i8", data, index)
+		if math_abs(value) > MAX_SAFE_INTEGER then
+			decodingError("INT64 is outside Luau's exact number range", index)
+		end
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.NUMBER_FLOAT32 then
+		-- Retained so older payloads can still be decoded.
+		ensureBytes(data, index, 4, "FLOAT32")
+		local value, nextIndex = string_unpack("<f", data, index)
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.NUMBER_FLOAT64 then
+		ensureBytes(data, index, 8, "FLOAT64")
+		local value, nextIndex = string_unpack("<d", data, index)
+		indexRef[1] = nextIndex
+		return value
+	elseif typeId == TYPE.STRING_SHORT or typeId == TYPE.STRING_LONG then
+		local length, contentIndex = readLength(data, index)
+		local endIndex = contentIndex + length
+		if endIndex > #data + 1 then
+			decodingError("String out of bounds: " .. tostring(length), contentIndex)
+		end
+		indexRef[1] = endIndex
+		return string_sub(data, contentIndex, endIndex - 1)
+	elseif typeId == TYPE.REFERENCE then
+		local referenceId = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(referenceId) ~= "number" or referenceId ~= math_floor(referenceId) then
+			decodingError("Reference ID must be an integer", indexRef[1])
+		end
+		local referencedValue = refs[referenceId]
+		if referencedValue == nil then
+			decodingError("Invalid reference ID: " .. tostring(referenceId), indexRef[1])
+		end
+		return referencedValue
+	elseif typeId == TYPE.TABLE_START then
+		local result = {}
+		refs[#refs + 1] = result
+
+		while true do
+			ensureBytes(data, indexRef[1], 1, "TABLE")
+			if string_byte(data, indexRef[1]) == TYPE.TABLE_END then
+				indexRef[1] += 1
+				break
+			end
+
+			local key = decodeValue(data, indexRef, refs, currentDepth + 1)
+			if key == nil then
+				decodingError("Decoded nil table key", indexRef[1])
+			end
+			local childValue = decodeValue(data, indexRef, refs, currentDepth + 1)
+			result[key] = childValue
+		end
+
+		return result
+	elseif typeId == TYPE.ARRAY_START then
+		local result = {}
+		refs[#refs + 1] = result
+		local arrayIndex = 1
+
+		while true do
+			ensureBytes(data, indexRef[1], 1, "ARRAY")
+			if string_byte(data, indexRef[1]) == TYPE.ARRAY_END then
+				indexRef[1] += 1
+				break
+			end
+
+			result[arrayIndex] = decodeValue(data, indexRef, refs, currentDepth + 1)
+			arrayIndex += 1
+		end
+
+		return result
+	elseif typeId == TYPE.ARRAY_HOMOGENEOUS then
+		local result = {}
+		refs[#refs + 1] = result
+
+		index = indexRef[1]
+		ensureBytes(data, index, 2, "Homogeneous array header")
+		local valueTypeId = string_byte(data, index)
+		local separator = string_byte(data, index + 1)
+		indexRef[1] = index + 2
+
+		if separator ~= TYPE.VALUE_TYPE_ID then
+			decodingError("Invalid homogeneous-array separator", index + 1)
+		end
+
+		local count = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(count) ~= "number" or count < 0 or count ~= math_floor(count) then
+			decodingError("Invalid homogeneous-array count: " .. tostring(count), indexRef[1])
+		end
+
+		index = indexRef[1]
+		if valueTypeId == TYPE.NUMBER_FLOAT64 then
+			ensureBytes(data, index, count * 8, "Homogeneous FLOAT64 array")
+			for i = 1, count do
+				local value, nextIndex = string_unpack("<d", data, index)
+				result[i] = value
+				index = nextIndex
+			end
+		elseif valueTypeId == TYPE.NUMBER_FLOAT32 then
+			-- Legacy compatibility only. Older encoders used a one-byte zero marker
+			-- mixed with raw FLOAT32 bytes, which is inherently ambiguous.
+			for i = 1, count do
+				ensureBytes(data, index, 1, "Legacy homogeneous FLOAT32 array")
+				if string_byte(data, index) == TYPE.NUMBER_ZERO then
+					result[i] = 0
+					index += 1
+				else
+					ensureBytes(data, index, 4, "Legacy homogeneous FLOAT32 value")
+					local value, nextIndex = string_unpack("<f", data, index)
+					result[i] = value
+					index = nextIndex
+				end
+			end
+		elseif valueTypeId == TYPE.BOOLEAN_FALSE or valueTypeId == TYPE.BOOLEAN_TRUE then
+			ensureBytes(data, index, count, "Homogeneous boolean array")
+			for i = 1, count do
+				local booleanTypeId = string_byte(data, index)
+				if booleanTypeId ~= TYPE.BOOLEAN_FALSE and booleanTypeId ~= TYPE.BOOLEAN_TRUE then
+					decodingError("Invalid homogeneous boolean value", index)
+				end
+				result[i] = booleanTypeId == TYPE.BOOLEAN_TRUE
+				index += 1
+			end
+		else
+			for i = 1, count do
+				indexRef[1] = index
+				result[i] = decodeValue(data, indexRef, refs, currentDepth + 1)
+				index = indexRef[1]
+			end
+		end
+
+		indexRef[1] = index
+		return result
+	elseif typeId == TYPE.VECTOR3 then
+		ensureBytes(data, index, 24, "Vector3")
+		local x, y, z, nextIndex = string_unpack("<ddd", data, index)
+		indexRef[1] = nextIndex
+		return Vector3_new(x, y, z)
+	elseif typeId == TYPE.VECTOR2 then
+		ensureBytes(data, index, 16, "Vector2")
+		local x, y, nextIndex = string_unpack("<dd", data, index)
+		indexRef[1] = nextIndex
+		return Vector2_new(x, y)
+	elseif typeId == TYPE.COLOR3 then
+		ensureBytes(data, index, 24, "Color3")
+		local r, g, b, nextIndex = string_unpack("<ddd", data, index)
+		indexRef[1] = nextIndex
+		return Color3_new(r, g, b)
+	elseif typeId == TYPE.UDIM2 then
+		ensureBytes(data, index, 32, "UDim2")
+		local xScale, xOffset, yScale, yOffset, nextIndex = string_unpack("<dddd", data, index)
+		indexRef[1] = nextIndex
+		return UDim2_new(xScale, xOffset, yScale, yOffset)
+	elseif typeId == TYPE.RECT then
+		ensureBytes(data, index, 32, "Rect")
+		local minX, minY, maxX, maxY, nextIndex = string_unpack("<dddd", data, index)
+		indexRef[1] = nextIndex
+		return Rect_new(Vector2_new(minX, minY), Vector2_new(maxX, maxY))
+	elseif typeId == TYPE.CFRAME then
+		ensureBytes(data, index, 96, "CFrame")
+		local components = {string_unpack("<dddddddddddd", data, index)}
+		local nextIndex = table_remove(components)
+		indexRef[1] = nextIndex
+		return CFrame_new(table_unpack(components, 1, 12))
+	elseif typeId == TYPE.ENUM then
+		local enumTypeName = decodeValue(data, indexRef, refs, currentDepth + 1)
+		local enumItemName = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(enumTypeName) ~= "string" or type(enumItemName) ~= "string" then
+			decodingError("Enum names must be strings", indexRef[1])
+		end
+
+		enumTypeName = string_match(enumTypeName, "^Enum%.(.+)$") or enumTypeName
+		local ok, enumItem = pcall(function()
+			local enumType = Enum_Type[enumTypeName]
+			return enumType and enumType[enumItemName]
+		end)
+		if ok and enumItem then
+			return enumItem
+		end
+		warn("[BE Dec] Unable to resolve EnumItem:", enumTypeName, enumItemName)
+		return nil
 	elseif typeId == TYPE.INSTANCE_REF then
-		local path = decodeValue(data, indexRef, refs_decoding, currentDepth + 1)
-		print(path)
-		if type(path) ~= "string" then
-			return decodingError("Instance reference path must be a string, got " .. type(path), indexRef[1])
+		local encodedPath = decodeValue(data, indexRef, refs, currentDepth + 1)
+		local instance
+
+		if type(encodedPath) == "string" then
+			instance = getLegacyInstanceAtPath(encodedPath)
+		elseif type(encodedPath) == "table" then
+			instance = getInstanceAtSegments(encodedPath)
+		else
+			decodingError("Instance path must be a string or segment array", indexRef[1])
 		end
-		if path == "" then
-			warn("[BE Dec] Decoded empty instance path.")
-			return nil -- Treat empty path as nil
-		end
-		
-		print(GetInstanceAtPath(path))
-		local instance = GetInstanceAtPath(path)
 
 		if instance then
-			-- Found the instance successfully
 			return instance
-		else
-			-- Instance not found (FindFirstChild returned nil)
-			warn(("[BE Dec] Instance not found via path %q. (Possible reasons: Not replicated yet, FilteringEnabled issue, destroyed, invalid path)."):format(path))
-			return nil -- Return nil as the instance couldn't be resolved
 		end
-	elseif typeId == TYPE.DATETIME then if indexRef[1]+7>#data then return decodingError("EOF DT",indexRef[1]) end; local ms,idx=string_unpack("<q",data,indexRef[1]); if not idx then return decodingError("Unpk DT",indexRef[1]) end; indexRef[1]=idx; local ok,dt=pcall(DateTime_FromMillis,ms); if ok then return dt else warn("[BE Dec] DT fail:",ms); return nil end
-	elseif typeId == TYPE.BRICKCOLOR then local num=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(num)~="number" then return decodingError("BC num",indexRef[1]) end; local ok,bc=pcall(BrickColor_new,num); if ok then return bc else warn("[BE Dec] BC fail:",num); return nil end
-	elseif typeId == TYPE.NUMBERSEQUENCE then local nk=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(nk)~="number" or nk<0 or nk>20 then warn("[BE Dec] NS cnt clamp:",nk); nk=math.max(0,math.min(20,nk)) elseif nk~=math.floor(nk) then return decodingError("NS cnt int",indexRef[1]) end; local kps={}; local idx=indexRef[1]; local bn=nk*24; if idx+bn>#data+1 then return decodingError(("NS EOF %d need %d"):format(nk,bn),idx) end
-		for i=1,nk do local t,v,e,ni=string_unpack("<ddd",data,idx); if not ni then return decodingError(("NS Unpk %d/%d"):format(i,nk),idx) end; idx=ni; local ok,kp=pcall(NumberSequenceKeypoint_new,t,v,e); if ok then kps[i]=kp else warn("[BE Dec] NS Key fail:",t,v,e) end end; indexRef[1]=idx; local ok,ns=pcall(NumberSequence_new,kps); if ok then return ns else warn("[BE Dec] NS New fail"); return nil end -- Kept <ddd
-	elseif typeId == TYPE.COLORSEQUENCE then local nk=decodeValue(data,indexRef,refs_decoding,currentDepth+1); if type(nk)~="number" or nk<0 or nk>20 then warn("[BE Dec] CS cnt clamp:",nk); nk=math.max(0,math.min(20,nk)) elseif nk~=math.floor(nk) then return decodingError("CS cnt int",indexRef[1]) end; local kps={}; local idx=indexRef[1]; local bn=nk*32; if idx+bn>#data+1 then return decodingError(("CS EOF %d need %d"):format(nk,bn),idx) end
-		for i=1,nk do local t,r,g,b,ni=string_unpack("<dddd",data,idx); if not ni then return decodingError(("CS Unpk %d/%d"):format(i,nk),idx) end; idx=ni; local co,cv=pcall(Color3_new,r,g,b); if co then local ok,kp=pcall(ColorSequenceKeypoint_new,t,cv); if ok then kps[i]=kp else warn("[BE Dec] CS Key fail:",t,cv) end else warn("[BE Dec] CS Col3 fail:",r,g,b) end end; indexRef[1]=idx; local ok,cs=pcall(ColorSequence_new,kps); if ok then return cs else warn("[BE Dec] CS New fail"); return nil end -- Kept <dddd
-	elseif typeId == TYPE.BUFFER then local l,il=readLength(data,indexRef[1]); if not l then return nil end; local eob=il+l; if eob>#data+1 then return decodingError("Buf OOB "..l,il) end; local bd=string_sub(data,il,eob-1); indexRef[1]=eob; local ok,buf=pcall(buffer_fromstring,bd); if ok then return buf else warn("[BE Dec] Buf fail"); return nil end
-	else return decodingError("Unknown TypeID: " .. typeId, indexRef[1] - 1)
+		warn("[BE Dec] Unable to resolve instance reference.")
+		return nil
+	elseif typeId == TYPE.DATETIME then
+		ensureBytes(data, index, 8, "DateTime")
+		local milliseconds, nextIndex = string_unpack("<i8", data, index)
+		indexRef[1] = nextIndex
+		local ok, dateTime = pcall(DateTime_FromMillis, milliseconds)
+		if ok then
+			return dateTime
+		end
+		warn("[BE Dec] Unable to construct DateTime:", milliseconds)
+		return nil
+	elseif typeId == TYPE.BRICKCOLOR then
+		local number = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(number) ~= "number" then
+			decodingError("BrickColor number expected", indexRef[1])
+		end
+		local ok, brickColor = pcall(BrickColor_new, number)
+		if ok then
+			return brickColor
+		end
+		warn("[BE Dec] Unable to construct BrickColor:", number)
+		return nil
+	elseif typeId == TYPE.NUMBERSEQUENCE then
+		local count = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(count) ~= "number" or count < 0 or count > 20 or count ~= math_floor(count) then
+			decodingError("Invalid NumberSequence keypoint count: " .. tostring(count), indexRef[1])
+		end
+
+		index = indexRef[1]
+		ensureBytes(data, index, count * 24, "NumberSequence")
+		local keypoints = {}
+		for i = 1, count do
+			local time, value, envelope, nextIndex = string_unpack("<ddd", data, index)
+			index = nextIndex
+			local ok, keypoint = pcall(NumberSequenceKeypoint_new, time, value, envelope)
+			if not ok then
+				decodingError("Invalid NumberSequence keypoint", index)
+			end
+			keypoints[i] = keypoint
+		end
+		indexRef[1] = index
+
+		local ok, sequence = pcall(NumberSequence_new, keypoints)
+		if ok then
+			return sequence
+		end
+		warn("[BE Dec] Unable to construct NumberSequence.")
+		return nil
+	elseif typeId == TYPE.COLORSEQUENCE then
+		local count = decodeValue(data, indexRef, refs, currentDepth + 1)
+		if type(count) ~= "number" or count < 0 or count > 20 or count ~= math_floor(count) then
+			decodingError("Invalid ColorSequence keypoint count: " .. tostring(count), indexRef[1])
+		end
+
+		index = indexRef[1]
+		ensureBytes(data, index, count * 32, "ColorSequence")
+		local keypoints = {}
+		for i = 1, count do
+			local time, r, g, b, nextIndex = string_unpack("<dddd", data, index)
+			index = nextIndex
+			local okColor, color = pcall(Color3_new, r, g, b)
+			if not okColor then
+				decodingError("Invalid ColorSequence color", index)
+			end
+			local okKeypoint, keypoint = pcall(ColorSequenceKeypoint_new, time, color)
+			if not okKeypoint then
+				decodingError("Invalid ColorSequence keypoint", index)
+			end
+			keypoints[i] = keypoint
+		end
+		indexRef[1] = index
+
+		local ok, sequence = pcall(ColorSequence_new, keypoints)
+		if ok then
+			return sequence
+		end
+		warn("[BE Dec] Unable to construct ColorSequence.")
+		return nil
+	elseif typeId == TYPE.BUFFER then
+		local length, contentIndex = readLength(data, index)
+		local endIndex = contentIndex + length
+		if endIndex > #data + 1 then
+			decodingError("Buffer out of bounds: " .. tostring(length), contentIndex)
+		end
+		local contents = string_sub(data, contentIndex, endIndex - 1)
+		indexRef[1] = endIndex
+		local ok, result = pcall(buffer_fromstring, contents)
+		if ok then
+			return result
+		end
+		warn("[BE Dec] Unable to construct buffer.")
+		return nil
+	else
+		decodingError("Unknown TypeID: " .. tostring(typeId), index - 1)
 	end
 end
 
+function BinaryEncoder.encode(value: any): string
+	local output = {}
+	local state: EncoderState = {
+		refs = {},
+		nextRefId = 1,
+	}
 
---[[--- Public Interface ---]]
-function BinaryEncoder.encode(value: any): (string?) 
-	local buffer = {}
-	local refs_encoding = {}
-	local ok, err = pcall(encodeValue, value, refs_encoding, buffer, 0)
+	local ok, result = pcall(encodeValue, value, state, output, 0)
 	if not ok then
-		-- Rethrow the error, ensuring it's captured by any outer pcall (like the one around LZ4)
-		error("[BinaryEncoder.encode error] " .. tostring(err), 0) -- Use level 0 to preserve stack trace from encodeValue
-		-- return nil -- Alternative: return nil instead of erroring
+		error("[BinaryEncoder.encode error] " .. tostring(result), 0)
 	end
-	return table_concat(buffer)
+
+	return table_concat(output)
 end
 
 function BinaryEncoder.decode(data: string): any
-	if type(data) ~= "string" then error("BE decode requires string, got "..type(data), 2) end
-	if #data == 0 then error("BE decode requires non-empty string", 2) end
-	local refs_decoding = {}
-	local indexRef = {1}
-	-- Wrap decodeValue in pcall to catch internal errors more gracefully if needed,
-	-- though decodeValue already uses decodingError which halts execution.
-	local result = decodeValue(data, indexRef, refs_decoding, 0)
-	if indexRef[1] <= #data then
-		warn(("[BE Dec Warning] Extra %d bytes left. End: %d, Total: %d"):format(#data - indexRef[1] + 1, indexRef[1], #data))
+	if type(data) ~= "string" then
+		error("BinaryEncoder.decode requires a string, got " .. type(data), 2)
 	end
+	if #data == 0 then
+		error("BinaryEncoder.decode requires a non-empty string", 2)
+	end
+
+	local indexRef = {1}
+	local refs = {}
+	local result = decodeValue(data, indexRef, refs, 0)
+
+	if indexRef[1] <= #data then
+		warn(("[BE Dec] Extra %d trailing bytes remain (next=%d, total=%d)."):format(#data - indexRef[1] + 1, indexRef[1], #data))
+	end
+
 	return result
 end
 
